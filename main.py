@@ -61,8 +61,8 @@ async def init_db():
         await db.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                email TEXT UNIQUE NOT NULL,
-                username TEXT UNIQUE NOT NULL,
+                email TEXT UNIQUE NOT NULL COLLATE NOCASE,
+                username TEXT UNIQUE NOT NULL COLLATE NOCASE,
                 display_name TEXT NOT NULL,
                 password_hash TEXT NOT NULL,
                 avatar_url TEXT DEFAULT '',
@@ -74,10 +74,10 @@ async def init_db():
         await db.execute("""
             CREATE TABLE IF NOT EXISTS channels (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                channel_tag TEXT UNIQUE NOT NULL,
+                channel_tag TEXT UNIQUE NOT NULL COLLATE NOCASE,
                 name TEXT NOT NULL,
                 description TEXT DEFAULT '',
-                creator_username TEXT NOT NULL,
+                creator_username TEXT NOT NULL COLLATE NOCASE,
                 avatar_url TEXT DEFAULT '',
                 pinned_msg_id INTEGER DEFAULT 0,
                 is_group INTEGER DEFAULT 0,
@@ -88,9 +88,9 @@ async def init_db():
         await db.execute("""
             CREATE TABLE IF NOT EXISTS messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                sender_username TEXT NOT NULL,
+                sender_username TEXT NOT NULL COLLATE NOCASE,
                 sender_name TEXT NOT NULL,
-                target TEXT NOT NULL,
+                target TEXT NOT NULL COLLATE NOCASE,
                 text TEXT DEFAULT '',
                 msg_type TEXT DEFAULT 'text',
                 file_url TEXT DEFAULT '',
@@ -110,8 +110,8 @@ async def init_db():
         await db.execute("""
             CREATE TABLE IF NOT EXISTS blocks (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                blocker TEXT NOT NULL,
-                blocked TEXT NOT NULL,
+                blocker TEXT NOT NULL COLLATE NOCASE,
+                blocked TEXT NOT NULL COLLATE NOCASE,
                 UNIQUE(blocker, blocked)
             )
         """)
@@ -141,16 +141,17 @@ class ConnectionManager:
 
     async def connect(self, username: str, websocket: WebSocket):
         await websocket.accept()
-        self.active_connections[username] = websocket
+        self.active_connections[username.lower()] = websocket
         await self.broadcast_online()
 
     async def disconnect(self, username: str):
-        if username in self.active_connections:
-            del self.active_connections[username]
+        uname = username.lower()
+        if uname in self.active_connections:
+            del self.active_connections[uname]
             time_now = datetime.now().strftime("%H:%M")
             try:
                 async with aiosqlite.connect(DB_PATH) as db:
-                    await db.execute("UPDATE users SET last_seen = ? WHERE username = ?", (time_now, username))
+                    await db.execute("UPDATE users SET last_seen = ? WHERE LOWER(username) = ?", (time_now, uname))
                     await db.commit()
             except Exception:
                 pass
@@ -166,9 +167,10 @@ class ConnectionManager:
                 pass
 
     async def send_to_user(self, message: dict, recipient_username: str):
-        if recipient_username in self.active_connections:
+        r_uname = recipient_username.lower().strip().lstrip("@")
+        if r_uname in self.active_connections:
             try:
-                await self.active_connections[recipient_username].send_text(json.dumps(message))
+                await self.active_connections[r_uname].send_text(json.dumps(message))
             except Exception:
                 pass
 
@@ -217,18 +219,18 @@ async def register(data: RegisterModel):
         return {"status": "error", "message": "Юзернейм может содержать только латинские буквы, цифры и _"}
 
     if len(uname) < 3:
-        return {"status": "error", "message": "Юзернейм должен быть не короче 3 символов"}
+        return {"status": "error", "message": "Юзернейм должен быть от 3 символов"}
     if len(pwd) < 4:
         return {"status": "error", "message": "Пароль должен быть от 4 символов"}
 
     async with aiosqlite.connect(DB_PATH) as db:
-        cur_u = await db.execute("SELECT id FROM users WHERE username = ?", (uname,))
+        cur_u = await db.execute("SELECT id FROM users WHERE LOWER(username) = LOWER(?)", (uname,))
         if await cur_u.fetchone():
-            return {"status": "error", "message": f"Юзернейм @{uname} уже занят другим пользователем"}
+            return {"status": "error", "message": f"Юзернейм @{uname} уже занят! Выберите другой."}
 
-        cur_e = await db.execute("SELECT id FROM users WHERE email = ?", (email,))
+        cur_e = await db.execute("SELECT id FROM users WHERE LOWER(email) = LOWER(?)", (email,))
         if await cur_e.fetchone():
-            return {"status": "error", "message": "Этот Email уже зарегистрирован"}
+            return {"status": "error", "message": "Пользователь с такой почтой уже существует"}
 
         pwd_hash = hash_password(pwd)
         created_at = datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -256,7 +258,7 @@ async def login(data: LoginModel):
         cur = await db.execute(
             """SELECT username, display_name, email, avatar_url, custom_status 
                FROM users 
-               WHERE (email = ? OR username = ?) AND password_hash = ?""",
+               WHERE (LOWER(email) = LOWER(?) OR LOWER(username) = LOWER(?)) AND password_hash = ?""",
             (login_val, login_val, pwd_hash)
         )
         user = await cur.fetchone()
@@ -299,8 +301,9 @@ async def upload_file_endpoint(file: UploadFile = File(...)):
 
 @app.post("/api/upload_avatar")
 async def upload_avatar(username: str = Form(...), file: UploadFile = File(...)):
+    uname = username.strip().lower()
     ext = file.filename.split(".")[-1].lower() if "." in file.filename else "jpg"
-    filename = f"avatar_{username}_{uuid.uuid4().hex[:8]}.{ext}"
+    filename = f"avatar_{uname}_{uuid.uuid4().hex[:8]}.{ext}"
     file_path = os.path.join(UPLOAD_DIR, filename)
 
     with open(file_path, "wb") as buffer:
@@ -309,7 +312,7 @@ async def upload_avatar(username: str = Form(...), file: UploadFile = File(...))
     avatar_url = f"/uploads/{filename}"
 
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE users SET avatar_url = ? WHERE username = ?", (avatar_url, username))
+        await db.execute("UPDATE users SET avatar_url = ? WHERE LOWER(username) = LOWER(?)", (avatar_url, uname))
         await db.commit()
 
     return {"status": "ok", "avatar_url": avatar_url}
@@ -317,7 +320,7 @@ async def upload_avatar(username: str = Form(...), file: UploadFile = File(...))
 @app.post("/api/update_status")
 async def update_status(data: StatusModel):
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE users SET custom_status = ? WHERE username = ?", (data.status, data.username))
+        await db.execute("UPDATE users SET custom_status = ? WHERE LOWER(username) = LOWER(?)", (data.status, data.username.lower()))
         await db.commit()
     return {"status": "ok"}
 
@@ -325,6 +328,7 @@ async def update_status(data: StatusModel):
 async def create_channel(tag: str = Form(...), name: str = Form(...), desc: str = Form(""), creator: str = Form(...), is_group: int = Form(0), members: str = Form("[]"), file: UploadFile = File(None)):
     clean_tag = tag.strip().lstrip("#").lower()
     clean_name = name.strip()
+    creator_uname = creator.strip().lower()
     if not clean_tag or not clean_name:
         return {"status": "error", "message": "Укажите название и тег"}
 
@@ -338,15 +342,15 @@ async def create_channel(tag: str = Form(...), name: str = Form(...), desc: str 
         avatar_url = f"/uploads/{filename}"
 
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT id FROM channels WHERE channel_tag = ?", (clean_tag,))
+        cur = await db.execute("SELECT id FROM channels WHERE LOWER(channel_tag) = LOWER(?)", (clean_tag,))
         if await cur.fetchone():
-            return {"status": "error", "message": "Канал/группа с таким тегом уже существует"}
+            return {"status": "error", "message": "Канал или группа с таким тегом уже существует"}
 
         created_at = datetime.now().strftime("%Y-%m-%d %H:%M")
         await db.execute(
             """INSERT INTO channels (channel_tag, name, description, creator_username, avatar_url, is_group, members, created_at) 
                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (clean_tag, clean_name, desc, creator, avatar_url, is_group, members, created_at)
+            (clean_tag, clean_name, desc, creator_uname, avatar_url, is_group, members, created_at)
         )
         await db.commit()
 
@@ -354,16 +358,18 @@ async def create_channel(tag: str = Form(...), name: str = Form(...), desc: str 
 
 @app.get("/api/user_info")
 async def get_user_info(username: str, current_user: str):
+    target_uname = username.strip().lstrip("@").lower()
+    cur_uname = current_user.strip().lower()
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "SELECT username, display_name, email, avatar_url, created_at, custom_status, last_seen FROM users WHERE username = ?",
-            (username.strip().lstrip("@"),)
+            "SELECT username, display_name, email, avatar_url, created_at, custom_status, last_seen FROM users WHERE LOWER(username) = LOWER(?)",
+            (target_uname,)
         )
         row = await cur.fetchone()
         if not row:
             return {"status": "not_found"}
         
-        cur_blk = await db.execute("SELECT id FROM blocks WHERE blocker = ? AND blocked = ?", (current_user, row[0]))
+        cur_blk = await db.execute("SELECT id FROM blocks WHERE LOWER(blocker) = LOWER(?) AND LOWER(blocked) = LOWER(?)", (cur_uname, target_uname))
         is_blocked = bool(await cur_blk.fetchone())
 
         return {
@@ -381,30 +387,34 @@ async def get_user_info(username: str, current_user: str):
 
 @app.post("/api/toggle_block")
 async def toggle_block(data: BlockModel):
+    blkr = data.blocker.strip().lower()
+    blkd = data.blocked.strip().lower()
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT id FROM blocks WHERE blocker = ? AND blocked = ?", (data.blocker, data.blocked))
+        cur = await db.execute("SELECT id FROM blocks WHERE LOWER(blocker) = LOWER(?) AND LOWER(blocked) = LOWER(?)", (blkr, blkd))
         row = await cur.fetchone()
         if row:
-            await db.execute("DELETE FROM blocks WHERE blocker = ? AND blocked = ?", (data.blocker, data.blocked))
+            await db.execute("DELETE FROM blocks WHERE LOWER(blocker) = LOWER(?) AND LOWER(blocked) = LOWER(?)", (blkr, blkd))
             await db.commit()
             return {"status": "ok", "blocked": False}
         else:
-            await db.execute("INSERT INTO blocks (blocker, blocked) VALUES (?, ?)", (data.blocker, data.blocked))
+            await db.execute("INSERT INTO blocks (blocker, blocked) VALUES (?, ?)", (blkr, blkd))
             await db.commit()
             return {"status": "ok", "blocked": True}
 
 @app.get("/api/chats")
 async def get_user_chats(username: str):
+    uname = username.strip().lower()
     async with aiosqlite.connect(DB_PATH) as db:
         chats = []
-        cur_blk = await db.execute("SELECT blocked FROM blocks WHERE blocker = ?", (username,))
-        blocked_list = [r[0] for r in await cur_blk.fetchall()]
+        cur_blk = await db.execute("SELECT blocked FROM blocks WHERE LOWER(blocker) = LOWER(?)", (uname,))
+        blocked_list = [r[0].lower() for r in await cur_blk.fetchall()]
 
+        # Каналы и группы
         cur_ch = await db.execute("SELECT channel_tag, name, avatar_url, pinned_msg_id, is_group, description, creator_username FROM channels")
         for ch in await cur_ch.fetchall():
             tag_key = f"#{ch[0]}"
             cur_last = await db.execute(
-                "SELECT text, msg_type, timestamp FROM messages WHERE target = ? AND is_deleted = 0 ORDER BY id DESC LIMIT 1",
+                "SELECT text, msg_type, timestamp FROM messages WHERE LOWER(target) = LOWER(?) AND is_deleted = 0 ORDER BY id DESC LIMIT 1",
                 (tag_key,)
             )
             last = await cur_last.fetchone()
@@ -430,29 +440,34 @@ async def get_user_chats(username: str):
                 "is_blocked": False
             })
 
+        # Приватные диалоги (ТОЛЬКО там, где текущий пользователь является отправителем или получателем)
         cur_peers = await db.execute("""
             SELECT DISTINCT 
-                CASE WHEN sender_username = ? THEN target ELSE sender_username END AS peer
+                CASE WHEN LOWER(sender_username) = LOWER(?) THEN target ELSE sender_username END AS peer
             FROM messages 
-            WHERE (sender_username = ? OR target = ?) 
+            WHERE (LOWER(sender_username) = LOWER(?) OR LOWER(target) = LOWER(?)) 
               AND target NOT LIKE '#%'
-        """, (username, username, username))
+        """, (uname, uname, uname))
         
-        peers = [r[0] for r in await cur_peers.fetchall() if r[0] != username and not r[0].startswith("#")]
+        peers = [r[0].lower() for r in await cur_peers.fetchall() if r[0].lower() != uname and not r[0].startswith("#")]
 
         for p in peers:
-            cur_u = await db.execute("SELECT display_name, avatar_url, custom_status, last_seen FROM users WHERE username = ?", (p,))
+            cur_u = await db.execute("SELECT username, display_name, avatar_url, custom_status, last_seen FROM users WHERE LOWER(username) = LOWER(?)", (p,))
             u_data = await cur_u.fetchone()
-            name = u_data[0] if u_data else p
-            avatar = u_data[1] if u_data else ""
-            status = u_data[2] if u_data else "online"
-            last_seen = u_data[3] if u_data else ""
+            if not u_data:
+                continue
+            real_uname = u_data[0]
+            name = u_data[1]
+            avatar = u_data[2] or ""
+            status = u_data[3] or "online"
+            last_seen = u_data[4] or ""
             
             cur_last = await db.execute("""
                 SELECT text, msg_type, timestamp, is_read, sender_username FROM messages 
-                WHERE ((sender_username = ? AND target = ?) OR (sender_username = ? AND target = ?)) AND is_deleted = 0
+                WHERE ((LOWER(sender_username) = LOWER(?) AND LOWER(target) = LOWER(?)) OR (LOWER(sender_username) = LOWER(?) AND LOWER(target) = LOWER(?))) 
+                  AND is_deleted = 0
                 ORDER BY id DESC LIMIT 1
-            """, (username, p, p, username))
+            """, (uname, p, p, uname))
             last = await cur_last.fetchone()
             last_text = ""
             last_read = 0
@@ -466,9 +481,9 @@ async def get_user_chats(username: str):
                 else: last_text = last[0] or "📎 Файл"
 
             chats.append({
-                "key": p,
+                "key": real_uname,
                 "name": name,
-                "tag": f"@{p}",
+                "tag": f"@{real_uname}",
                 "type": "user",
                 "avatar": avatar,
                 "custom_status": status,
@@ -478,7 +493,7 @@ async def get_user_chats(username: str):
                 "last_sender": last_sender,
                 "time": last[2] if last else "",
                 "pinned_id": 0,
-                "is_dev": is_dev(p),
+                "is_dev": is_dev(real_uname),
                 "is_blocked": p in blocked_list
             })
 
@@ -488,6 +503,7 @@ async def get_user_chats(username: str):
 async def search(q: str = "", current_user: str = "", offset: int = 0, limit: int = 15):
     raw_query = str(q).strip()
     clean_q = raw_query.lstrip('@').lstrip('#').lower()
+    cur_uname = current_user.strip().lower()
     if not clean_q:
         return {"results": [], "has_more": False}
 
@@ -496,6 +512,8 @@ async def search(q: str = "", current_user: str = "", offset: int = 0, limit: in
         cur_u = await db.execute("SELECT username, display_name, email, avatar_url FROM users")
         for r in await cur_u.fetchall():
             uname, dname, email, avatar = r[0], r[1], r[2], r[3]
+            if cur_uname and uname.lower() == cur_uname:
+                continue
             s1 = calculate_score(clean_q, uname)
             s2 = calculate_score(clean_q, dname)
             s3 = calculate_score(clean_q, email)
@@ -531,19 +549,20 @@ async def search(q: str = "", current_user: str = "", offset: int = 0, limit: in
                     "is_dev": False
                 })
 
-        if current_user:
+        # Поиск сообщений строго в диалогах текущего пользователя
+        if cur_uname:
             cur_m = await db.execute("""
                 SELECT id, sender_username, sender_name, target, text, timestamp 
                 FROM messages 
                 WHERE is_deleted = 0 
                   AND msg_type = 'text' 
-                  AND (sender_username = ? OR target = ? OR target LIKE '#%')
+                  AND (LOWER(sender_username) = LOWER(?) OR LOWER(target) = LOWER(?) OR target LIKE '#%')
                 ORDER BY id DESC LIMIT 150
-            """, (current_user, current_user))
+            """, (cur_uname, cur_uname))
             for m in await cur_m.fetchall():
                 mid, s_user, s_name, target, text, m_time = m[0], m[1], m[2], m[3], m[4] or "", m[5]
                 if clean_q in text.lower():
-                    dialog_key = target if target.startswith("#") else (s_user if s_user != current_user else target)
+                    dialog_key = target if target.startswith("#") else (s_user if s_user.lower() != cur_uname else target)
                     results.append({
                         "score": 35,
                         "type": "message",
@@ -562,26 +581,32 @@ async def search(q: str = "", current_user: str = "", offset: int = 0, limit: in
 
 @app.get("/api/history")
 async def get_history(user: str, target: str):
+    u_req = user.strip().lower()
+    t_req = target.strip()
     async with aiosqlite.connect(DB_PATH) as db:
-        if target.startswith("#"):
+        if t_req.startswith("#"):
             cur = await db.execute(
                 """SELECT id, sender_username, sender_name, target, text, msg_type, file_url, file_name, 
                           reply_to_id, reply_to_text, reply_to_sender, forward_from, reactions, is_read, is_edited, is_deleted, timestamp, avatar_url 
-                   FROM messages WHERE target = ? AND is_deleted = 0 ORDER BY id ASC LIMIT 250""",
-                (target,)
+                   FROM messages WHERE LOWER(target) = LOWER(?) AND is_deleted = 0 ORDER BY id ASC LIMIT 250""",
+                (t_req,)
             )
         else:
-            await db.execute("UPDATE messages SET is_read = 1 WHERE sender_username = ? AND target = ?", (target, user))
+            t_uname = t_req.lower()
+            # Отмечаем прочитанными только те сообщения, которые прислали НАМ
+            await db.execute("UPDATE messages SET is_read = 1 WHERE LOWER(sender_username) = LOWER(?) AND LOWER(target) = LOWER(?)", (t_uname, u_req))
             await db.commit()
 
+            # Строгая изоляция: только сообщения между этими двумя пользователями
             cur = await db.execute(
                 """SELECT id, sender_username, sender_name, target, text, msg_type, file_url, file_name, 
                           reply_to_id, reply_to_text, reply_to_sender, forward_from, reactions, is_read, is_edited, is_deleted, timestamp, avatar_url 
                    FROM messages 
-                   WHERE ((sender_username = ? AND target = ?) OR (sender_username = ? AND target = ?)) 
+                   WHERE ((LOWER(sender_username) = LOWER(?) AND LOWER(target) = LOWER(?)) 
+                       OR (LOWER(sender_username) = LOWER(?) AND LOWER(target) = LOWER(?))) 
                      AND is_deleted = 0
                    ORDER BY id ASC LIMIT 250""",
-                (user, target, target, user)
+                (u_req, t_uname, t_uname, u_req)
             )
         rows = await cur.fetchall()
         return [{
@@ -751,6 +776,7 @@ HTML_TEMPLATE = """
             margin-bottom: 12px;
             display: none;
             text-align: center;
+            font-weight: 600;
         }
         
         .btn-primary {
@@ -1461,7 +1487,7 @@ HTML_TEMPLATE = """
 
 <script>
     let user = JSON.parse(localStorage.getItem("messenger_user") || "null");
-    let currentTarget = localStorage.getItem("messenger_target") || "";
+    let currentTarget = "";
     let currentTheme = localStorage.getItem("messenger_theme") || "dark";
     let isRegister = false;
     let ws = null;
@@ -1606,6 +1632,7 @@ HTML_TEMPLATE = """
             });
             const data = await res.json();
             if (data.status === "ok") {
+                localStorage.removeItem("messenger_target");
                 user = data;
                 localStorage.setItem("messenger_user", JSON.stringify(user));
                 location.reload();
@@ -1623,6 +1650,7 @@ HTML_TEMPLATE = """
             });
             const data = await res.json();
             if (data.status === "ok") {
+                localStorage.removeItem("messenger_target");
                 user = data;
                 localStorage.setItem("messenger_user", JSON.stringify(user));
                 location.reload();
@@ -1633,8 +1661,7 @@ HTML_TEMPLATE = """
     }
 
     function logout() {
-        localStorage.removeItem("messenger_user");
-        localStorage.removeItem("messenger_target");
+        localStorage.clear();
         location.reload();
     }
 
@@ -1667,7 +1694,7 @@ HTML_TEMPLATE = """
             if (data.type === "online_list") {
                 onlineUsers = data.users || [];
                 if (!document.getElementById("search-input").value.trim()) renderSidebar();
-            } else if (data.type === "typing" && data.sender === currentTarget) {
+            } else if (data.type === "typing" && data.sender.toLowerCase() === currentTarget.toLowerCase()) {
                 document.getElementById("header-sub").innerText = "печатает...";
                 clearTimeout(typingTimeout);
                 typingTimeout = setTimeout(() => {
@@ -1675,24 +1702,28 @@ HTML_TEMPLATE = """
                 }, 2000);
             } else if (data.type === "msg") {
                 const isGroup = data.target.startsWith("#");
-                const chatKey = isGroup ? data.target : data.sender_username;
-                
-                if (data.sender_username !== user.username) {
+                const senderMatch = data.sender_username.toLowerCase() === currentTarget.toLowerCase();
+                const targetMatch = data.target.toLowerCase() === currentTarget.toLowerCase();
+                const isMine = data.sender_username.toLowerCase() === user.username.toLowerCase();
+
+                if (!isMine) {
                     playNotificationSound();
                     showBrowserNotification(data.sender_name, data.text || "Медиафайл");
                 }
 
-                if (currentTarget === chatKey || (isGroup && currentTarget === data.target) || (data.sender_username === user.username && data.target === currentTarget)) {
+                if (isGroup ? targetMatch : (senderMatch || (isMine && targetMatch))) {
                     currentMessages.push(data);
                     renderAllMessages();
-                    if (data.sender_username !== user.username && !isGroup) {
+                    if (!isMine && !isGroup) {
                         ws.send(JSON.stringify({ action: "read", target: data.sender_username }));
                     }
                 }
                 fetchUserChats();
             } else if (data.type === "read_receipt") {
-                if (currentTarget === data.reader) {
-                    currentMessages.forEach(m => { if (m.sender_username === user.username) m.is_read = true; });
+                if (currentTarget.toLowerCase() === data.reader.toLowerCase()) {
+                    currentMessages.forEach(m => { 
+                        if (m.sender_username.toLowerCase() === user.username.toLowerCase()) m.is_read = true; 
+                    });
                     renderAllMessages();
                 }
                 fetchUserChats();
@@ -1702,7 +1733,7 @@ HTML_TEMPLATE = """
         };
 
         fetchUserChats().then(() => {
-            if (currentTarget && currentTarget !== "Общий чат") selectChat(currentTarget);
+            if (currentTarget) selectChat(currentTarget);
             else if (chatsList.length > 0) selectChat(chatsList[0].key);
         });
     }
@@ -1744,7 +1775,7 @@ HTML_TEMPLATE = """
             document.getElementById("info-date").innerText = "Регистрация: " + data.created_at;
             renderAvatarEl(document.getElementById("info-avatar"), data.display_name, data.avatar_url);
             
-            const isOnline = onlineUsers.includes(data.username);
+            const isOnline = onlineUsers.includes(data.username.toLowerCase());
             const stEl = document.getElementById("info-status-text");
             if (data.custom_status === "dnd") {
                 stEl.innerText = "⛔ Не беспокоить";
@@ -1767,7 +1798,7 @@ HTML_TEMPLATE = """
     }
 
     function openChannelSettings() {
-        const chat = chatsList.find(c => c.key === currentTarget);
+        const chat = chatsList.find(c => c.key.toLowerCase() === currentTarget.toLowerCase());
         if (!chat) return;
         document.getElementById("edit-chan-name").value = chat.name;
         document.getElementById("edit-chan-desc").value = chat.desc || "";
@@ -1907,7 +1938,7 @@ HTML_TEMPLATE = """
             const isUserDev = item.is_dev;
             
             div.onclick = () => {
-                const exists = chatsList.find(c => c.key === item.key);
+                const exists = chatsList.find(c => c.key.toLowerCase() === item.key.toLowerCase());
                 if (!exists && item.type !== 'message') {
                     chatsList.unshift({
                         key: item.key,
@@ -1963,17 +1994,17 @@ HTML_TEMPLATE = """
         }
 
         chatsList.forEach(chat => {
-            const isOnline = onlineUsers.includes(chat.key);
+            const isOnline = onlineUsers.includes(chat.key.toLowerCase());
             const isPeerDev = checkIsDev(chat.key);
             const isDnd = chat.custom_status === "dnd";
             const isInv = chat.custom_status === "offline";
 
             const div = document.createElement("div");
-            div.className = `chat-item ${currentTarget === chat.key ? 'active' : ''}`;
+            div.className = `chat-item ${currentTarget && currentTarget.toLowerCase() === chat.key.toLowerCase() ? 'active' : ''}`;
             div.onclick = () => selectChat(chat.key);
 
             let checkIcon = "";
-            if (chat.last_sender === user.username) {
+            if (chat.last_sender && chat.last_sender.toLowerCase() === user.username.toLowerCase()) {
                 checkIcon = chat.last_read ? '<span class="read-status">✓✓ </span>' : '<span style="opacity:0.6;">✓ </span>';
             }
 
@@ -2002,13 +2033,14 @@ HTML_TEMPLATE = """
 
     function updateHeaderSubtitle() {
         const sub = document.getElementById("header-sub");
+        if (!currentTarget) return;
         if (currentTarget.startsWith("#")) {
-            const chat = chatsList.find(c => c.key === currentTarget);
+            const chat = chatsList.find(c => c.key.toLowerCase() === currentTarget.toLowerCase());
             sub.innerText = chat ? (chat.type === 'group' ? 'Групповая беседа' : 'Канал') : 'Канал';
             return;
         }
-        const isOnline = onlineUsers.includes(currentTarget);
-        const chat = chatsList.find(c => c.key === currentTarget);
+        const isOnline = onlineUsers.includes(currentTarget.toLowerCase());
+        const chat = chatsList.find(c => c.key.toLowerCase() === currentTarget.toLowerCase());
         if (chat && chat.custom_status === "dnd") {
             sub.innerText = "⛔ Не беспокоить";
             sub.style.color = "#ef4444";
@@ -2024,12 +2056,11 @@ HTML_TEMPLATE = """
     async function selectChat(key) {
         if (!key) return;
         currentTarget = key;
-        localStorage.setItem("messenger_target", key);
 
         document.getElementById("chat-placeholder").style.display = "none";
         document.getElementById("chat-content").style.display = "flex";
         
-        let chat = chatsList.find(c => c.key === key);
+        let chat = chatsList.find(c => c.key.toLowerCase() === key.toLowerCase());
         const name = chat ? chat.name : key;
         const avatar = chat ? chat.avatar : "";
         const isPeerDev = checkIsDev(key);
@@ -2062,7 +2093,7 @@ HTML_TEMPLATE = """
         const box = document.getElementById("messages");
         box.innerHTML = "";
         currentMessages.forEach(m => {
-            const isMine = m.sender_username === user.username;
+            const isMine = m.sender_username.toLowerCase() === user.username.toLowerCase();
             const row = document.createElement("div");
             row.className = `msg-row ${isMine ? 'mine' : 'theirs'}`;
 
@@ -2379,23 +2410,24 @@ async def get_client():
 
 @app.websocket("/ws/{username}")
 async def ws_endpoint(websocket: WebSocket, username: str):
-    await manager.connect(username, websocket)
+    uname = username.strip().lower()
+    await manager.connect(uname, websocket)
     try:
         while True:
             raw = await websocket.receive_text()
             data = json.loads(raw)
             action = data.get("action", "send")
-            target = data.get("target")
+            target = data.get("target", "").strip()
 
             if action == "typing":
-                await manager.send_to_user({"type": "typing", "sender": username}, target)
+                await manager.send_to_user({"type": "typing", "sender": uname}, target)
                 continue
 
             elif action == "read":
                 async with aiosqlite.connect(DB_PATH) as db:
-                    await db.execute("UPDATE messages SET is_read = 1 WHERE sender_username = ? AND target = ?", (target, username))
+                    await db.execute("UPDATE messages SET is_read = 1 WHERE LOWER(sender_username) = LOWER(?) AND LOWER(target) = LOWER(?)", (target.lower(), uname))
                     await db.commit()
-                await manager.send_to_user({"type": "read_receipt", "reader": username}, target)
+                await manager.send_to_user({"type": "read_receipt", "reader": uname}, target)
                 continue
 
             elif action == "reaction":
@@ -2407,18 +2439,18 @@ async def ws_endpoint(websocket: WebSocket, username: str):
                     if row:
                         reacts = json.loads(row[0] or "{}")
                         if emoji not in reacts:
-                            reacts[emoji] = {"count": 1, "users": [username]}
+                            reacts[emoji] = {"count": 1, "users": [uname]}
                         else:
                             if isinstance(reacts[emoji], int):
-                                reacts[emoji] = {"count": reacts[emoji] + 1, "users": [username]}
+                                reacts[emoji] = {"count": reacts[emoji] + 1, "users": [uname]}
                             else:
-                                if username in reacts[emoji]["users"]:
-                                    reacts[emoji]["users"].remove(username)
+                                if uname in reacts[emoji]["users"]:
+                                    reacts[emoji]["users"].remove(uname)
                                     reacts[emoji]["count"] = max(0, reacts[emoji]["count"] - 1)
                                     if reacts[emoji]["count"] == 0:
                                         del reacts[emoji]
                                 else:
-                                    reacts[emoji]["users"].append(username)
+                                    reacts[emoji]["users"].append(uname)
                                     reacts[emoji]["count"] += 1
 
                         await db.execute("UPDATE messages SET reactions = ? WHERE id = ?", (json.dumps(reacts), msg_id))
@@ -2429,14 +2461,14 @@ async def ws_endpoint(websocket: WebSocket, username: str):
                     await manager.broadcast_channel(payload)
                 else:
                     await manager.send_to_user(payload, target)
-                    await manager.send_to_user(payload, username)
+                    await manager.send_to_user(payload, uname)
                 continue
 
             elif action == "edit":
                 msg_id = data.get("msg_id")
                 new_text = data.get("text")
                 async with aiosqlite.connect(DB_PATH) as db:
-                    await db.execute("UPDATE messages SET text = ?, is_edited = 1 WHERE id = ? AND sender_username = ?", (new_text, msg_id, username))
+                    await db.execute("UPDATE messages SET text = ?, is_edited = 1 WHERE id = ? AND LOWER(sender_username) = LOWER(?)", (new_text, msg_id, uname))
                     await db.commit()
                 
                 payload = {"type": "edit_msg", "msg_id": msg_id, "text": new_text, "target": target}
@@ -2444,13 +2476,13 @@ async def ws_endpoint(websocket: WebSocket, username: str):
                     await manager.broadcast_channel(payload)
                 else:
                     await manager.send_to_user(payload, target)
-                    await manager.send_to_user(payload, username)
+                    await manager.send_to_user(payload, uname)
                 continue
 
             elif action == "delete":
                 msg_id = data.get("msg_id")
                 async with aiosqlite.connect(DB_PATH) as db:
-                    await db.execute("UPDATE messages SET is_deleted = 1 WHERE id = ? AND sender_username = ?", (msg_id, username))
+                    await db.execute("UPDATE messages SET is_deleted = 1 WHERE id = ? AND LOWER(sender_username) = LOWER(?)", (msg_id, uname))
                     await db.commit()
                 
                 payload = {"type": "delete_msg", "msg_id": msg_id, "target": target}
@@ -2458,7 +2490,7 @@ async def ws_endpoint(websocket: WebSocket, username: str):
                     await manager.broadcast_channel(payload)
                 else:
                     await manager.send_to_user(payload, target)
-                    await manager.send_to_user(payload, username)
+                    await manager.send_to_user(payload, uname)
                 continue
 
             # Отправка нового сообщения
@@ -2477,7 +2509,7 @@ async def ws_endpoint(websocket: WebSocket, username: str):
                     """INSERT INTO messages (sender_username, sender_name, target, text, msg_type, file_url, file_name, 
                                              reply_to_id, reply_to_text, reply_to_sender, forward_from, timestamp, avatar_url) 
                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (username, data.get("sender_name", username), target, text, msg_type, file_url, file_name, 
+                    (uname, data.get("sender_name", uname), target, text, msg_type, file_url, file_name, 
                      reply_id, reply_text, reply_sender, forward_from, time_str, data.get("avatar", ""))
                 )
                 await db.commit()
@@ -2486,8 +2518,8 @@ async def ws_endpoint(websocket: WebSocket, username: str):
             msg_out = {
                 "type": "msg",
                 "id": msg_id,
-                "sender_username": username,
-                "sender_name": data.get("sender_name", username),
+                "sender_username": uname,
+                "sender_name": data.get("sender_name", uname),
                 "target": target,
                 "text": text,
                 "msg_type": msg_type,
@@ -2502,23 +2534,22 @@ async def ws_endpoint(websocket: WebSocket, username: str):
                 "is_edited": False,
                 "time": time_str,
                 "avatar": data.get("avatar", ""),
-                "is_dev": is_dev(username)
+                "is_dev": is_dev(uname)
             }
 
             if target.startswith("#"):
                 await manager.broadcast_channel(msg_out)
             else:
                 async with aiosqlite.connect(DB_PATH) as db:
-                    cur_block = await db.execute("SELECT id FROM blocks WHERE blocker = ? AND blocked = ?", (target, username))
+                    cur_block = await db.execute("SELECT id FROM blocks WHERE LOWER(blocker) = LOWER(?) AND LOWER(blocked) = LOWER(?)", (target.lower(), uname))
                     is_target_blocked = bool(await cur_block.fetchone())
                 
                 if not is_target_blocked:
                     await manager.send_to_user(msg_out, recipient_username=target)
-                await manager.send_to_user(msg_out, recipient_username=username)
+                await manager.send_to_user(msg_out, recipient_username=uname)
 
     except WebSocketDisconnect:
-        await manager.disconnect(username)
+        await manager.disconnect(uname)
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=80)
-    
