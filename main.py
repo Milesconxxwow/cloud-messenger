@@ -7,13 +7,13 @@ import aiosqlite
 import re
 from datetime import datetime
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
 
-app = FastAPI(title="Cipher Messenger Pro with Admin Panel")
+app = FastAPI(title="Cipher Messenger Pro with Permissions")
 
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -235,7 +235,7 @@ class ReportModel(BaseModel):
 class AdminActionModel(BaseModel):
     admin_username: str
     target_username: str
-    action: str  # "ban", "unban", "make_admin", "remove_admin", "delete_report"
+    action: str
     report_id: int = 0
 
 @app.post("/api/register")
@@ -302,7 +302,6 @@ async def login(data: LoginModel):
             if user[6] == 1:
                 return {"status": "error", "message": "Ваш аккаунт заблокирован администратором."}
             
-            # Автоматически выдаем админку если в DEV_USERNAMES
             if is_admin(user[0]) and user[5] == 0:
                 await db.execute("UPDATE users SET is_admin = 1 WHERE LOWER(username) = LOWER(?)", (user[0],))
                 await db.commit()
@@ -427,7 +426,6 @@ async def get_admin_data(username: str):
         if not row or (row[0] != 1 and not is_admin(uname)):
             return {"status": "error", "message": "Доступ запрещен"}
 
-        # Пользователи
         cur_u = await db.execute("SELECT username, display_name, email, custom_status, last_seen, is_admin, is_banned FROM users")
         users = []
         for u in await cur_u.fetchall():
@@ -442,7 +440,6 @@ async def get_admin_data(username: str):
                 "is_online": u[0].lower() in manager.active_connections
             })
 
-        # Жалобы
         cur_r = await db.execute("SELECT id, reporter, reported_user, reason, timestamp FROM reports ORDER BY id DESC")
         reports = []
         for r in await cur_r.fetchall():
@@ -1730,7 +1727,6 @@ HTML_TEMPLATE = """
     </div>
 </div>
 
-<!-- Модалка Просмотра Чужого Профиля -->
 <div id="user-info-modal" class="modal-overlay" style="display: none;">
     <div class="card-modal" style="text-align: center;">
         <h2>Профиль пользователя</h2>
@@ -1744,7 +1740,6 @@ HTML_TEMPLATE = """
         <p id="info-status-text" style="font-size: 0.85rem; color: var(--online-green); margin-bottom: 4px;">🟢 В сети</p>
         <p id="info-date" style="color: var(--text-sub); font-size: 0.8rem; margin-bottom: 16px;">Регистрация: ...</p>
         
-        <!-- Кнопка жалобы -->
         <div id="report-box" style="margin-bottom: 12px; text-align: left;">
             <input type="text" id="report-reason-input" placeholder="Причина жалобы (например, спам, оскорбления)" style="margin-bottom: 6px;">
             <button class="btn-primary" style="background: #eab308; color: #000;" onclick="submitReport()">⚠️ Пожаловаться</button>
@@ -1755,7 +1750,6 @@ HTML_TEMPLATE = """
     </div>
 </div>
 
-<!-- Админ-панель Модалка -->
 <div id="admin-modal" class="modal-overlay" style="display: none;">
     <div class="card-modal" style="max-width: 700px;">
         <h2>🛡️ Панель Администратора</h2>
@@ -1766,12 +1760,10 @@ HTML_TEMPLATE = """
             <button class="btn-primary" style="width: auto; padding: 8px 16px; background: #eab308; color:#000;" onclick="switchAdminTab('reports')">⚠️ Жалобы (<span id="adm-reports-count">0</span>)</button>
         </div>
 
-        <!-- Вкладка пользователей -->
         <div id="adm-tab-users" style="max-height: 350px; overflow-y: auto;">
             <div id="adm-users-list"></div>
         </div>
 
-        <!-- Вкладка жалоб -->
         <div id="adm-tab-reports" style="max-height: 350px; overflow-y: auto; display: none;">
             <div id="adm-reports-list"></div>
         </div>
@@ -1867,7 +1859,7 @@ HTML_TEMPLATE = """
                 <div class="input-wrapper">
                     <input type="text" id="msg-input" placeholder="Сообщение..." oninput="handleTyping()" onkeydown="if(event.key==='Enter') sendMsg()">
                 </div>
-                <button class="bar-btn" id="voice-btn" title="Голосовое сообщение" onclick="toggleVoiceRecord()">🎙️</button>
+                <button class="bar-btn" id="voice-btn" title="Голосовое сообщение" onclick="requestMicAndToggleRecord()">🎙️</button>
                 <button class="send-btn" onclick="sendMsg()">➤</button>
             </div>
 
@@ -1930,8 +1922,11 @@ HTML_TEMPLATE = """
         } catch(e) {}
     }
 
-    if ("Notification" in window && Notification.permission !== "granted" && Notification.permission !== "denied") {
-        Notification.requestPermission();
+    // Запрос разрешений на микрофон и уведомления при старте приложения
+    async function requestPermissionsOnStart() {
+        if ("Notification" in window && Notification.permission !== "granted" && Notification.permission !== "denied") {
+            await Notification.requestPermission();
+        }
     }
 
     function showBrowserNotification(title, text) {
@@ -1989,6 +1984,7 @@ HTML_TEMPLATE = """
     }
 
     window.onload = () => {
+        requestPermissionsOnStart();
         if (user && user.username) {
             document.getElementById("auth-modal").style.display = "none";
             startApp();
@@ -2976,7 +2972,8 @@ HTML_TEMPLATE = """
         document.getElementById("media-file-input").value = "";
     }
 
-    async function toggleVoiceRecord() {
+    // Функция явного запроса разрешения на микрофон перед записью
+    async function requestMicAndToggleRecord() {
         const btn = document.getElementById("voice-btn");
         if (!isRecording) {
             try {
@@ -2997,7 +2994,7 @@ HTML_TEMPLATE = """
                 btn.classList.add("recording");
                 btn.title = "Нажмите для отправки";
             } catch (err) {
-                alert("Нет доступа к микрофону");
+                alert("Для записи голосовых сообщений необходимо разрешить доступ к микрофону в браузере.");
             }
         } else {
             mediaRecorder.stop();
@@ -3062,7 +3059,6 @@ async def get_client():
 async def ws_endpoint(websocket: WebSocket, username: str):
     uname = username.strip().lower()
     
-    # Проверка перед подключением: забанен ли пользователь
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("SELECT is_banned FROM users WHERE LOWER(username) = LOWER(?)", (uname,))
         row = await cur.fetchone()
@@ -3154,7 +3150,6 @@ async def ws_endpoint(websocket: WebSocket, username: str):
                     await manager.send_to_user(payload, uname)
                 continue
 
-            # Отправка нового сообщения
             text = data.get("text", "")
             msg_type = data.get("msg_type", "text")
             file_url = data.get("file_url", "")
