@@ -5,8 +5,8 @@ import uuid
 import hashlib
 import aiosqlite
 from datetime import datetime
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form, Query
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -80,6 +80,14 @@ async def init_db():
                 avatar_url TEXT DEFAULT ''
             )
         """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS blocks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                blocker TEXT NOT NULL,
+                blocked TEXT NOT NULL,
+                UNIQUE(blocker, blocked)
+            )
+        """)
         await db.commit()
 
 class ConnectionManager:
@@ -135,6 +143,10 @@ class RegisterModel(BaseModel):
 class LoginModel(BaseModel):
     login: str
     password: str
+
+class BlockModel(BaseModel):
+    blocker: str
+    blocked: str
 
 @app.post("/api/register")
 async def register(data: RegisterModel):
@@ -262,11 +274,60 @@ async def create_channel(tag: str = Form(...), name: str = Form(...), desc: str 
 
     return {"status": "ok", "channel_tag": clean_tag, "name": clean_name, "avatar_url": avatar_url}
 
+@app.get("/api/user_info")
+async def get_user_info(username: str, current_user: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT username, display_name, email, avatar_url, created_at FROM users WHERE username = ?",
+            (username.strip().lstrip("@"),)
+        )
+        row = await cur.fetchone()
+        if not row:
+            return {"status": "not_found"}
+        
+        cur_blk = await db.execute(
+            "SELECT id FROM blocks WHERE blocker = ? AND blocked = ?",
+            (current_user, row[0])
+        )
+        is_blocked = bool(await cur_blk.fetchone())
+
+        return {
+            "status": "ok",
+            "username": row[0],
+            "display_name": row[1],
+            "email": row[2],
+            "avatar_url": row[3] or "",
+            "created_at": row[4],
+            "is_dev": is_dev(row[0]),
+            "is_blocked": is_blocked
+        }
+
+@app.post("/api/toggle_block")
+async def toggle_block(data: BlockModel):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT id FROM blocks WHERE blocker = ? AND blocked = ?",
+            (data.blocker, data.blocked)
+        )
+        row = await cur.fetchone()
+        if row:
+            await db.execute("DELETE FROM blocks WHERE blocker = ? AND blocked = ?", (data.blocker, data.blocked))
+            await db.commit()
+            return {"status": "ok", "blocked": False}
+        else:
+            await db.execute("INSERT INTO blocks (blocker, blocked) VALUES (?, ?)", (data.blocker, data.blocked))
+            await db.commit()
+            return {"status": "ok", "blocked": True}
+
 @app.get("/api/chats")
 async def get_user_chats(username: str):
     async with aiosqlite.connect(DB_PATH) as db:
         chats = []
 
+        cur_blk = await db.execute("SELECT blocked FROM blocks WHERE blocker = ?", (username,))
+        blocked_list = [r[0] for r in await cur_blk.fetchall()]
+
+        # Каналы
         cur_ch = await db.execute("SELECT channel_tag, name, avatar_url, pinned_msg_id FROM channels")
         for ch in await cur_ch.fetchall():
             tag_key = f"#{ch[0]}"
@@ -288,9 +349,11 @@ async def get_user_chats(username: str):
                 "last_msg": last_text,
                 "time": last[2] if last else "",
                 "pinned_id": ch[3] or 0,
-                "is_dev": False
+                "is_dev": False,
+                "is_blocked": False
             })
 
+        # Приватные диалоги
         cur_peers = await db.execute("""
             SELECT DISTINCT 
                 CASE WHEN sender_username = ? THEN target ELSE sender_username END AS peer
@@ -326,7 +389,8 @@ async def get_user_chats(username: str):
                 "last_msg": last_text,
                 "time": last[2] if last else "",
                 "pinned_id": 0,
-                "is_dev": is_dev(p)
+                "is_dev": is_dev(p),
+                "is_blocked": p in blocked_list
             })
 
         return {"chats": chats}
@@ -409,7 +473,7 @@ HTML_TEMPLATE = """
 <html lang="ru">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
     <title>Cipher Messenger</title>
     <style>
         :root {
@@ -757,6 +821,7 @@ HTML_TEMPLATE = """
             border-radius: 50%;
             object-fit: cover;
             flex-shrink: 0;
+            cursor: pointer;
         }
 
         .bubble {
@@ -853,7 +918,6 @@ HTML_TEMPLATE = """
             cursor: pointer;
         }
 
-        /* Reply / Edit bar above input */
         .action-banner {
             background: #141722;
             padding: 8px 18px;
@@ -922,7 +986,6 @@ HTML_TEMPLATE = """
             justify-content: center;
         }
 
-        /* Message context menu */
         .msg-menu {
             position: fixed;
             background: #181c28;
@@ -971,7 +1034,6 @@ HTML_TEMPLATE = """
 </head>
 <body>
 
-<!-- Меню сообщения -->
 <div id="msg-menu" class="msg-menu">
     <div class="msg-menu-emojis">
         <span onclick="sendReaction('👍')">👍</span>
@@ -987,6 +1049,7 @@ HTML_TEMPLATE = """
     <div class="msg-menu-item" id="menu-del-btn" style="color: var(--danger-red);" onclick="deleteMessage()">🗑️ Удалить</div>
 </div>
 
+<!-- Модалка Авторизации -->
 <div id="auth-modal" class="modal-overlay">
     <div class="card-modal">
         <div class="brand-logo">⚡ CIPHER<span>.</span></div>
@@ -1002,6 +1065,7 @@ HTML_TEMPLATE = """
     </div>
 </div>
 
+<!-- Модалка Создания Канала -->
 <div id="channel-modal" class="modal-overlay" style="display: none;">
     <div class="card-modal">
         <h2>Создать канал</h2>
@@ -1018,6 +1082,7 @@ HTML_TEMPLATE = """
     </div>
 </div>
 
+<!-- Модалка Моего Профиля -->
 <div id="profile-modal" class="modal-overlay" style="display: none;">
     <div class="card-modal" style="text-align: center;">
         <h2>Мой Cipher ID</h2>
@@ -1034,6 +1099,23 @@ HTML_TEMPLATE = """
         <button class="btn-primary" onclick="uploadUserAvatar()">Сохранить аватарку</button>
         <button class="btn-cancel" onclick="logout()" style="color: var(--danger-red); margin-top: 8px;">Выйти из Cipher 🚪</button>
         <button class="btn-cancel" onclick="document.getElementById('profile-modal').style.display='none'">Закрыть</button>
+    </div>
+</div>
+
+<!-- Модалка Просмотра Чужого Профиля -->
+<div id="user-info-modal" class="modal-overlay" style="display: none;">
+    <div class="card-modal" style="text-align: center;">
+        <h2>Профиль пользователя</h2>
+        <div id="info-avatar" style="width: 80px; height: 80px; border-radius: 50%; margin: 15px auto; display:flex; align-items:center; justify-content:center; font-size:2rem; font-weight:bold; color:#fff; overflow:hidden;"></div>
+        <div style="display:flex; align-items:center; justify-content:center; gap:8px; margin-bottom:4px;">
+            <h3 id="info-name"></h3>
+            <span id="info-dev-badge" class="dev-badge" style="display:none;">🛠️ DEV</span>
+        </div>
+        <p id="info-tag" style="color: var(--badge-blue); font-size: 0.9rem; margin-bottom: 6px;"></p>
+        <p id="info-date" style="color: var(--text-sub); font-size: 0.8rem; margin-bottom: 16px;">В сети с: ...</p>
+        
+        <button class="btn-primary" id="info-block-btn" style="background:#ef4444;" onclick="toggleBlockContact()">🚫 Заблокировать</button>
+        <button class="btn-cancel" onclick="document.getElementById('user-info-modal').style.display='none'">Закрыть</button>
     </div>
 </div>
 
@@ -1075,8 +1157,8 @@ HTML_TEMPLATE = """
         <div id="chat-content" style="display:none; flex-direction:column; height:100%;">
             <div class="chat-header">
                 <button class="back-btn" onclick="document.body.classList.remove('in-chat')">←</button>
-                <div class="avatar-small" id="header-avatar" style="width:42px; height:42px; font-size:1.1rem; margin-right:12px;">?</div>
-                <div>
+                <div class="avatar-small" id="header-avatar" style="width:42px; height:42px; font-size:1.1rem; margin-right:12px; cursor:pointer;" onclick="openPeerInfo()">?</div>
+                <div style="cursor:pointer;" onclick="openPeerInfo()">
                     <div style="display:flex; align-items:center; gap:6px;">
                         <span id="header-title" style="font-weight:600; font-size:1rem;">Выберите чат</span>
                         <span id="header-dev-badge" class="dev-badge" style="display:none;">DEV</span>
@@ -1123,6 +1205,7 @@ HTML_TEMPLATE = """
     let selectedMsg = null;
     let replyMsg = null;
     let editMsg = null;
+    let viewingPeerInfo = null;
 
     let mediaRecorder = null;
     let audioChunks = [];
@@ -1266,7 +1349,7 @@ HTML_TEMPLATE = """
         };
 
         fetchUserChats().then(() => {
-            if (currentTarget) selectChat(currentTarget);
+            if (currentTarget && currentTarget !== "Общий чат") selectChat(currentTarget);
             else if (chatsList.length > 0) selectChat(chatsList[0].key);
         });
     }
@@ -1277,6 +1360,45 @@ HTML_TEMPLATE = """
         renderAvatarEl(document.getElementById("profile-avatar-preview"), user.display_name, user.avatar_url);
         if (checkIsDev(user.username)) document.getElementById("profile-dev-badge").style.display = "inline-flex";
         document.getElementById("profile-modal").style.display = "flex";
+    }
+
+    async function openPeerInfo(targetUsername = null) {
+        const target = targetUsername || currentTarget;
+        if (!target || target.startsWith("#")) return;
+
+        const res = await fetch(`/api/user_info?username=${encodeURIComponent(target)}&current_user=${encodeURIComponent(user.username)}`);
+        const data = await res.json();
+        if (data.status === "ok") {
+            viewingPeerInfo = data;
+            document.getElementById("info-name").innerText = data.display_name;
+            document.getElementById("info-tag").innerText = "@" + data.username;
+            document.getElementById("info-date").innerText = "Регистрация: " + data.created_at;
+            renderAvatarEl(document.getElementById("info-avatar"), data.display_name, data.avatar_url);
+            
+            document.getElementById("info-dev-badge").style.display = data.is_dev ? "inline-flex" : "none";
+            const btn = document.getElementById("info-block-btn");
+            btn.innerText = data.is_blocked ? "Разблокировать" : "🚫 Заблокировать";
+            btn.style.background = data.is_blocked ? "#22c55e" : "#ef4444";
+
+            document.getElementById("user-info-modal").style.display = "flex";
+        }
+    }
+
+    async function toggleBlockContact() {
+        if (!viewingPeerInfo) return;
+        const res = await fetch("/api/toggle_block", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({ blocker: user.username, blocked: viewingPeerInfo.username })
+        });
+        const data = await res.json();
+        if (data.status === "ok") {
+            viewingPeerInfo.is_blocked = data.blocked;
+            const btn = document.getElementById("info-block-btn");
+            btn.innerText = data.blocked ? "Разблокировать" : "🚫 Заблокировать";
+            btn.style.background = data.blocked ? "#22c55e" : "#ef4444";
+            fetchUserChats();
+        }
     }
 
     async function uploadUserAvatar() {
@@ -1354,7 +1476,8 @@ HTML_TEMPLATE = """
                         avatar: item.avatar,
                         last_msg: item.desc || "Новый диалог",
                         time: "",
-                        is_dev: isUserDev
+                        is_dev: isUserDev,
+                        is_blocked: false
                     });
                 }
                 selectChat(item.key);
@@ -1382,7 +1505,7 @@ HTML_TEMPLATE = """
         list.innerHTML = "";
         
         if (chatsList.length === 0) {
-            list.innerHTML = `<div style="padding:30px 20px; text-align:center; color:var(--text-sub); font-size:0.85rem;">Нет чатов.<br>Создайте канал ➕ или найдите друга 🔍</div>`;
+            list.innerHTML = `<div style="padding:30px 20px; text-align:center; color:var(--text-sub); font-size:0.85rem;">Нет чатов.<br>Создайте канал ➕ или найдите контакт через поиск 🔍</div>`;
             return;
         }
 
@@ -1403,6 +1526,7 @@ HTML_TEMPLATE = """
                         <div class="chat-name">
                             <span>${chat.name}</span>
                             ${isPeerDev ? '<span class="dev-badge">DEV</span>' : ''}
+                            ${chat.is_blocked ? '<span style="font-size:0.7rem; color:var(--danger-red);">[Блок]</span>' : ''}
                         </div>
                         <div class="chat-time">${chat.time || ''}</div>
                     </div>
@@ -1486,10 +1610,10 @@ HTML_TEMPLATE = """
             const isMsgDev = checkIsDev(m.sender_username);
 
             row.innerHTML = `
-                ${!isMine && m.avatar ? `<img src="${m.avatar}" class="msg-avatar">` : ''}
+                ${!isMine && m.avatar ? `<img src="${m.avatar}" class="msg-avatar" onclick="openPeerInfo('${m.sender_username}')">` : ''}
                 <div class="bubble" oncontextmenu="event.preventDefault(); openMsgMenu(event, ${m.id}, ${isMine})">
                     ${!isMine ? `
-                        <div class="bubble-header">
+                        <div class="bubble-header" onclick="openPeerInfo('${m.sender_username}')">
                             <span>${m.sender_name}</span>
                             ${isMsgDev ? '<span class="dev-badge">DEV</span>' : ''}
                             <span style="font-weight:normal; opacity:0.6; font-size:0.7rem;">@${m.sender_username}</span>
@@ -1730,7 +1854,7 @@ async def ws_endpoint(websocket: WebSocket, username: str):
                 
                 payload = {"type": "reaction", "msg_id": msg_id, "target": target}
                 if target.startswith("#"):
-                    await manager.broadcast_channel(payload)
+                    await manager.broadcast(payload)
                 else:
                     await manager.send_to_user(payload, target)
                     await manager.send_to_user(payload, username)
@@ -1745,7 +1869,7 @@ async def ws_endpoint(websocket: WebSocket, username: str):
                 
                 payload = {"type": "edit_msg", "msg_id": msg_id, "text": new_text, "target": target}
                 if target.startswith("#"):
-                    await manager.broadcast_channel(payload)
+                    await manager.broadcast(payload)
                 else:
                     await manager.send_to_user(payload, target)
                     await manager.send_to_user(payload, username)
@@ -1759,13 +1883,13 @@ async def ws_endpoint(websocket: WebSocket, username: str):
                 
                 payload = {"type": "delete_msg", "msg_id": msg_id, "target": target}
                 if target.startswith("#"):
-                    await manager.broadcast_channel(payload)
+                    await manager.broadcast(payload)
                 else:
                     await manager.send_to_user(payload, target)
                     await manager.send_to_user(payload, username)
                 continue
 
-            # Default: action == "send"
+            # Отправка нового сообщения
             text = data.get("text", "")
             msg_type = data.get("msg_type", "text")
             file_url = data.get("file_url", "")
@@ -1775,8 +1899,14 @@ async def ws_endpoint(websocket: WebSocket, username: str):
             reply_sender = data.get("reply_to_sender", "")
             time_str = datetime.now().strftime("%H:%M")
 
-            msg_id = 0
+            # Проверка блокировки получателем
             async with aiosqlite.connect(DB_PATH) as db:
+                if not target.startswith("#"):
+                    cur_block = await db.execute("SELECT id FROM blocks WHERE blocker = ? AND blocked = ?", (target, username))
+                    if await cur_block.fetchone():
+                        # Получатель заблокировал отправителя — отправляем только самому себе
+                        pass
+
                 cur = await db.execute(
                     """INSERT INTO messages (sender_username, sender_name, target, text, msg_type, file_url, file_name, 
                                              reply_to_id, reply_to_text, reply_to_sender, timestamp, avatar_url) 
@@ -1810,7 +1940,12 @@ async def ws_endpoint(websocket: WebSocket, username: str):
             if target.startswith("#"):
                 await manager.broadcast(msg_out)
             else:
-                await manager.send_to_user(msg_out, recipient_username=target)
+                async with aiosqlite.connect(DB_PATH) as db:
+                    cur_block = await db.execute("SELECT id FROM blocks WHERE blocker = ? AND blocked = ?", (target, username))
+                    is_target_blocked = bool(await cur_block.fetchone())
+                
+                if not is_target_blocked:
+                    await manager.send_to_user(msg_out, recipient_username=target)
                 await manager.send_to_user(msg_out, recipient_username=username)
 
     except WebSocketDisconnect:
