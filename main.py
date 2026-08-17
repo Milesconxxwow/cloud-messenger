@@ -5,14 +5,14 @@ import uuid
 import hashlib
 import aiosqlite
 from datetime import datetime
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form, Query
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
 
-app = FastAPI(title="Cipher Messenger")
+app = FastAPI(title="Cipher Messenger Pro")
 
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -27,7 +27,6 @@ app.add_middleware(
 )
 
 DB_PATH = "messenger.db"
-
 DEV_USERNAMES = ["milesconxxwow", "miles"]
 
 def is_dev(username: str) -> bool:
@@ -57,6 +56,7 @@ async def init_db():
                 description TEXT DEFAULT '',
                 creator_username TEXT NOT NULL,
                 avatar_url TEXT DEFAULT '',
+                pinned_msg_id INTEGER DEFAULT 0,
                 created_at TEXT NOT NULL
             )
         """)
@@ -66,7 +66,16 @@ async def init_db():
                 sender_username TEXT NOT NULL,
                 sender_name TEXT NOT NULL,
                 target TEXT NOT NULL,
-                text TEXT NOT NULL,
+                text TEXT DEFAULT '',
+                msg_type TEXT DEFAULT 'text',
+                file_url TEXT DEFAULT '',
+                file_name TEXT DEFAULT '',
+                reply_to_id INTEGER DEFAULT 0,
+                reply_to_text TEXT DEFAULT '',
+                reply_to_sender TEXT DEFAULT '',
+                reactions TEXT DEFAULT '{}',
+                is_edited INTEGER DEFAULT 0,
+                is_deleted INTEGER DEFAULT 0,
                 timestamp TEXT NOT NULL,
                 avatar_url TEXT DEFAULT ''
             )
@@ -90,7 +99,7 @@ class ConnectionManager:
     async def broadcast_online(self):
         online = list(self.active_connections.keys())
         payload = json.dumps({"type": "online_list", "users": online})
-        for conn in self.active_connections.values():
+        for conn in list(self.active_connections.values()):
             try:
                 await conn.send_text(payload)
             except Exception:
@@ -98,10 +107,13 @@ class ConnectionManager:
 
     async def send_to_user(self, message: dict, recipient_username: str):
         if recipient_username in self.active_connections:
-            await self.active_connections[recipient_username].send_text(json.dumps(message))
+            try:
+                await self.active_connections[recipient_username].send_text(json.dumps(message))
+            except Exception:
+                pass
 
-    async def broadcast_channel(self, message: dict, sender_username: str = None):
-        for uname, conn in self.active_connections.items():
+    async def broadcast(self, message: dict, sender_username: str = None):
+        for uname, conn in list(self.active_connections.items()):
             if uname != sender_username:
                 try:
                     await conn.send_text(json.dumps(message))
@@ -132,11 +144,11 @@ async def register(data: RegisterModel):
     pwd = data.password.strip()
 
     if not email or not uname or not pwd:
-        return {"status": "error", "message": "Заполните все обязательные поля"}
+        return {"status": "error", "message": "Заполните все поля"}
     if len(uname) < 3:
-        return {"status": "error", "message": "Юзернейм должен быть от 3 символов"}
+        return {"status": "error", "message": "Юзернейм от 3 символов"}
     if len(pwd) < 4:
-        return {"status": "error", "message": "Пароль должен быть от 4 символов"}
+        return {"status": "error", "message": "Пароль от 4 символов"}
 
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("SELECT id FROM users WHERE email = ? OR username = ?", (email, uname))
@@ -182,6 +194,26 @@ async def login(data: LoginModel):
                 "is_dev": is_dev(user[0])
             }
         return {"status": "error", "message": "Неверный логин или пароль"}
+
+@app.post("/api/upload_file")
+async def upload_file_endpoint(file: UploadFile = File(...)):
+    ext = file.filename.split(".")[-1].lower() if "." in file.filename else "bin"
+    unique_name = f"file_{uuid.uuid4().hex[:12]}.{ext}"
+    file_path = os.path.join(UPLOAD_DIR, unique_name)
+
+    with open(file_path, "wb") as buf:
+        shutil.copyfileobj(file.file, buf)
+
+    is_img = ext in ["jpg", "jpeg", "png", "gif", "webp"]
+    is_audio = ext in ["webm", "ogg", "mp3", "wav", "m4a"]
+    file_type = "image" if is_img else ("voice" if is_audio else "document")
+
+    return {
+        "status": "ok",
+        "url": f"/uploads/{unique_name}",
+        "file_name": file.filename,
+        "msg_type": file_type
+    }
 
 @app.post("/api/upload_avatar")
 async def upload_avatar(username: str = Form(...), file: UploadFile = File(...)):
@@ -235,24 +267,30 @@ async def get_user_chats(username: str):
     async with aiosqlite.connect(DB_PATH) as db:
         chats = []
 
-        # Все каналы
-        cur_ch = await db.execute("SELECT channel_tag, name, avatar_url FROM channels")
+        cur_ch = await db.execute("SELECT channel_tag, name, avatar_url, pinned_msg_id FROM channels")
         for ch in await cur_ch.fetchall():
             tag_key = f"#{ch[0]}"
-            cur_last = await db.execute("SELECT text, timestamp FROM messages WHERE target = ? ORDER BY id DESC LIMIT 1", (tag_key,))
+            cur_last = await db.execute(
+                "SELECT text, msg_type, timestamp FROM messages WHERE target = ? AND is_deleted = 0 ORDER BY id DESC LIMIT 1",
+                (tag_key,)
+            )
             last = await cur_last.fetchone()
+            last_text = "Канал создан"
+            if last:
+                last_text = "🎙️ Голосовое" if last[1] == "voice" else ("📷 Фотография" if last[1] == "image" else (last[0] or "📎 Файл"))
+
             chats.append({
                 "key": tag_key,
                 "name": ch[1],
                 "tag": tag_key,
                 "type": "channel",
                 "avatar": ch[2] or "",
-                "last_msg": last[0] if last else "Канал создан",
-                "time": last[1] if last else "",
+                "last_msg": last_text,
+                "time": last[2] if last else "",
+                "pinned_id": ch[3] or 0,
                 "is_dev": False
             })
 
-        # Все собеседники из сообщений
         cur_peers = await db.execute("""
             SELECT DISTINCT 
                 CASE WHEN sender_username = ? THEN target ELSE sender_username END AS peer
@@ -270,11 +308,14 @@ async def get_user_chats(username: str):
             avatar = u_data[1] if u_data else ""
             
             cur_last = await db.execute("""
-                SELECT text, timestamp FROM messages 
-                WHERE (sender_username = ? AND target = ?) OR (sender_username = ? AND target = ?)
+                SELECT text, msg_type, timestamp FROM messages 
+                WHERE ((sender_username = ? AND target = ?) OR (sender_username = ? AND target = ?)) AND is_deleted = 0
                 ORDER BY id DESC LIMIT 1
             """, (username, p, p, username))
             last = await cur_last.fetchone()
+            last_text = ""
+            if last:
+                last_text = "🎙️ Голосовое" if last[1] == "voice" else ("📷 Фотография" if last[1] == "image" else (last[0] or "📎 Файл"))
 
             chats.append({
                 "key": p,
@@ -282,8 +323,9 @@ async def get_user_chats(username: str):
                 "tag": f"@{p}",
                 "type": "user",
                 "avatar": avatar,
-                "last_msg": last[0] if last else "",
-                "time": last[1] if last else "",
+                "last_msg": last_text,
+                "time": last[2] if last else "",
+                "pinned_id": 0,
                 "is_dev": is_dev(p)
             })
 
@@ -327,27 +369,39 @@ async def get_history(user: str, target: str):
     async with aiosqlite.connect(DB_PATH) as db:
         if target.startswith("#"):
             cur = await db.execute(
-                """SELECT sender_username, sender_name, target, text, timestamp, avatar_url 
-                   FROM messages WHERE target = ? ORDER BY id ASC LIMIT 200""",
+                """SELECT id, sender_username, sender_name, target, text, msg_type, file_url, file_name, 
+                          reply_to_id, reply_to_text, reply_to_sender, reactions, is_edited, is_deleted, timestamp, avatar_url 
+                   FROM messages WHERE target = ? AND is_deleted = 0 ORDER BY id ASC LIMIT 250""",
                 (target,)
             )
         else:
             cur = await db.execute(
-                """SELECT sender_username, sender_name, target, text, timestamp, avatar_url 
+                """SELECT id, sender_username, sender_name, target, text, msg_type, file_url, file_name, 
+                          reply_to_id, reply_to_text, reply_to_sender, reactions, is_edited, is_deleted, timestamp, avatar_url 
                    FROM messages 
-                   WHERE (sender_username = ? AND target = ?) OR (sender_username = ? AND target = ?) 
-                   ORDER BY id ASC LIMIT 200""",
+                   WHERE ((sender_username = ? AND target = ?) OR (sender_username = ? AND target = ?)) 
+                     AND is_deleted = 0
+                   ORDER BY id ASC LIMIT 250""",
                 (user, target, target, user)
             )
         rows = await cur.fetchall()
         return [{
-            "sender_username": r[0],
-            "sender_name": r[1],
-            "target": r[2],
-            "text": r[3],
-            "time": r[4],
-            "avatar": r[5],
-            "is_dev": is_dev(r[0])
+            "id": r[0],
+            "sender_username": r[1],
+            "sender_name": r[2],
+            "target": r[3],
+            "text": r[4],
+            "msg_type": r[5],
+            "file_url": r[6],
+            "file_name": r[7],
+            "reply_to_id": r[8],
+            "reply_to_text": r[9],
+            "reply_to_sender": r[10],
+            "reactions": json.loads(r[11] or "{}"),
+            "is_edited": bool(r[12]),
+            "time": r[14],
+            "avatar": r[15],
+            "is_dev": is_dev(r[1])
         } for r in rows]
 
 HTML_TEMPLATE = """
@@ -390,21 +444,18 @@ HTML_TEMPLATE = """
             overflow: hidden;
         }
 
-        /* Бейдж разработчика */
         .dev-badge {
             background: linear-gradient(135deg, #8b5cf6, #ec4899);
             color: #fff;
             font-size: 0.65rem;
             font-weight: 800;
-            padding: 2px 7px;
+            padding: 2px 6px;
             border-radius: 6px;
             letter-spacing: 0.5px;
             display: inline-flex;
             align-items: center;
-            gap: 3px;
             box-shadow: 0 0 10px rgba(236, 72, 153, 0.35);
             text-transform: uppercase;
-            vertical-align: middle;
         }
 
         .modal-overlay {
@@ -466,7 +517,6 @@ HTML_TEMPLATE = """
             cursor: pointer;
             margin-top: 6px;
         }
-        .btn-primary:hover { opacity: 0.9; }
         .btn-cancel {
             background: transparent;
             color: var(--text-sub);
@@ -524,10 +574,7 @@ HTML_TEMPLATE = """
             flex-shrink: 0;
         }
 
-        .sidebar-actions {
-            display: flex;
-            gap: 8px;
-        }
+        .sidebar-actions { display: flex; gap: 8px; }
         .icon-btn {
             background: var(--bg-input);
             border: 1px solid #1e2332;
@@ -567,10 +614,7 @@ HTML_TEMPLATE = """
             color: var(--text-sub);
         }
 
-        .chat-list {
-            flex: 1;
-            overflow-y: auto;
-        }
+        .chat-list { flex: 1; overflow-y: auto; }
         .chat-item {
             display: flex;
             align-items: center;
@@ -597,7 +641,6 @@ HTML_TEMPLATE = """
             font-weight: 700;
             font-size: 1.15rem;
             color: #fff;
-            user-select: none;
         }
         .online-dot {
             position: absolute;
@@ -612,10 +655,7 @@ HTML_TEMPLATE = """
         }
         .online-dot.visible { display: block; }
 
-        .chat-details {
-            flex: 1;
-            min-width: 0;
-        }
+        .chat-details { flex: 1; min-width: 0; }
         .chat-top-row {
             display: flex;
             justify-content: space-between;
@@ -633,16 +673,8 @@ HTML_TEMPLATE = """
             align-items: center;
             gap: 6px;
         }
-        .chat-time {
-            font-size: 0.72rem;
-            color: var(--text-sub);
-            margin-left: 6px;
-        }
-        .chat-bottom-row {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }
+        .chat-time { font-size: 0.72rem; color: var(--text-sub); margin-left: 6px; }
+        .chat-bottom-row { display: flex; justify-content: space-between; align-items: center; }
         .chat-preview {
             font-size: 0.82rem;
             color: var(--text-sub);
@@ -690,19 +722,32 @@ HTML_TEMPLATE = """
             cursor: pointer;
         }
 
+        .pinned-banner {
+            background: #151924;
+            padding: 8px 18px;
+            display: none;
+            align-items: center;
+            justify-content: space-between;
+            border-bottom: 1px solid #1e2434;
+            font-size: 0.82rem;
+            cursor: pointer;
+        }
+        .pinned-banner span.label { color: var(--badge-blue); font-weight: 600; margin-right: 8px; }
+
         .messages-container {
             flex: 1;
-            padding: 24px;
+            padding: 20px;
             overflow-y: auto;
             display: flex;
             flex-direction: column;
-            gap: 10px;
+            gap: 8px;
         }
         .msg-row {
             display: flex;
             align-items: flex-end;
             gap: 8px;
             width: 100%;
+            position: relative;
         }
         .msg-row.mine { justify-content: flex-end; }
 
@@ -716,11 +761,13 @@ HTML_TEMPLATE = """
 
         .bubble {
             max-width: 65%;
-            padding: 10px 14px;
+            padding: 9px 13px;
             border-radius: 14px;
             font-size: 0.92rem;
-            line-height: 1.45;
+            line-height: 1.4;
             word-break: break-word;
+            position: relative;
+            cursor: pointer;
         }
         .msg-row.theirs .bubble {
             background: var(--bubble-in);
@@ -742,52 +789,175 @@ HTML_TEMPLATE = """
             align-items: center;
             gap: 6px;
         }
+        .bubble-reply {
+            background: rgba(0, 0, 0, 0.25);
+            border-left: 3px solid var(--badge-blue);
+            padding: 4px 8px;
+            border-radius: 4px;
+            margin-bottom: 6px;
+            font-size: 0.78rem;
+        }
+        .bubble-reply .reply-user { font-weight: 600; color: #93c5fd; }
+        
+        .bubble-img {
+            max-width: 100%;
+            border-radius: 8px;
+            margin-top: 4px;
+            display: block;
+        }
+
+        .audio-player {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-top: 4px;
+        }
+        .audio-player audio { height: 32px; width: 220px; outline: none; }
+
+        .file-attachment {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            background: rgba(0,0,0,0.2);
+            padding: 8px 12px;
+            border-radius: 8px;
+            text-decoration: none;
+            color: #fff;
+            font-size: 0.85rem;
+            margin-top: 4px;
+        }
+
         .bubble-footer {
             display: flex;
             justify-content: flex-end;
+            align-items: center;
+            gap: 4px;
             margin-top: 4px;
         }
-        .bubble-time {
-            font-size: 0.68rem;
-            color: rgba(255, 255, 255, 0.55);
+        .bubble-time { font-size: 0.68rem; color: rgba(255, 255, 255, 0.6); }
+
+        .reactions-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 4px;
+            margin-top: 4px;
+        }
+        .reaction-chip {
+            background: rgba(255, 255, 255, 0.12);
+            border-radius: 12px;
+            padding: 2px 7px;
+            font-size: 0.75rem;
+            display: flex;
+            align-items: center;
+            gap: 4px;
+            cursor: pointer;
         }
 
+        /* Reply / Edit bar above input */
+        .action-banner {
+            background: #141722;
+            padding: 8px 18px;
+            display: none;
+            align-items: center;
+            justify-content: space-between;
+            border-top: 1px solid var(--border-color);
+            font-size: 0.84rem;
+        }
+        .action-banner span.title { color: var(--badge-blue); font-weight: 600; }
+        .action-close { cursor: pointer; color: var(--text-sub); font-size: 1.1rem; }
+
         .input-bar {
-            padding: 14px 20px;
+            padding: 10px 18px;
             background: var(--bg-header);
             border-top: 1px solid var(--border-color);
             display: flex;
             align-items: center;
-            gap: 12px;
+            gap: 10px;
         }
         .input-wrapper {
             flex: 1;
             background: var(--bg-input);
             border: 1px solid #1e2332;
-            border-radius: 12px;
+            border-radius: 14px;
             padding: 0 14px;
             display: flex;
             align-items: center;
+            gap: 8px;
         }
         .input-wrapper input {
             flex: 1;
             background: transparent;
             border: none;
             color: #fff;
-            padding: 14px 0;
+            padding: 12px 0;
             font-size: 0.95rem;
             outline: none;
         }
+
+        .bar-btn {
+            background: transparent;
+            border: none;
+            color: var(--text-sub);
+            cursor: pointer;
+            font-size: 1.25rem;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: color 0.2s;
+        }
+        .bar-btn:hover { color: #fff; }
+        .bar-btn.recording { color: var(--danger-red); animation: pulse 1s infinite; }
+
         .send-btn {
             background: var(--badge-blue);
             border: none;
             color: white;
-            width: 44px;
-            height: 44px;
+            width: 42px;
+            height: 42px;
             border-radius: 12px;
             cursor: pointer;
             font-size: 1.1rem;
+            display: flex;
+            align-items: center;
+            justify-content: center;
         }
+
+        /* Message context menu */
+        .msg-menu {
+            position: fixed;
+            background: #181c28;
+            border: 1px solid #282f42;
+            border-radius: 14px;
+            padding: 6px;
+            display: none;
+            flex-direction: column;
+            z-index: 2000;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.8);
+            min-width: 170px;
+        }
+        .msg-menu-item {
+            padding: 9px 14px;
+            font-size: 0.85rem;
+            color: #fff;
+            border-radius: 8px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .msg-menu-item:hover { background: #222838; }
+        .msg-menu-emojis {
+            display: flex;
+            gap: 6px;
+            padding: 6px 10px;
+            border-bottom: 1px solid #282f42;
+            font-size: 1.25rem;
+            justify-content: space-between;
+        }
+        .msg-menu-emojis span { cursor: pointer; transition: transform 0.15s; }
+        .msg-menu-emojis span:hover { transform: scale(1.3); }
+
+        @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.4; } 100% { opacity: 1; } }
 
         @media (max-width: 768px) {
             #sidebar { width: 100%; }
@@ -800,6 +970,22 @@ HTML_TEMPLATE = """
     </style>
 </head>
 <body>
+
+<!-- Меню сообщения -->
+<div id="msg-menu" class="msg-menu">
+    <div class="msg-menu-emojis">
+        <span onclick="sendReaction('👍')">👍</span>
+        <span onclick="sendReaction('❤️')">❤️</span>
+        <span onclick="sendReaction('🔥')">🔥</span>
+        <span onclick="sendReaction('😂')">😂</span>
+        <span onclick="sendReaction('😮')">😮</span>
+        <span onclick="sendReaction('👏')">👏</span>
+    </div>
+    <div class="msg-menu-item" onclick="startReply()">💬 Ответить</div>
+    <div class="msg-menu-item" onclick="pinMessage()">📌 Закрепить</div>
+    <div class="msg-menu-item" id="menu-edit-btn" onclick="startEdit()">✏️ Изменить</div>
+    <div class="msg-menu-item" id="menu-del-btn" style="color: var(--danger-red);" onclick="deleteMessage()">🗑️ Удалить</div>
+</div>
 
 <div id="auth-modal" class="modal-overlay">
     <div class="card-modal">
@@ -834,11 +1020,11 @@ HTML_TEMPLATE = """
 
 <div id="profile-modal" class="modal-overlay" style="display: none;">
     <div class="card-modal" style="text-align: center;">
-        <h2>Мой профиль</h2>
+        <h2>Мой Cipher ID</h2>
         <div id="profile-avatar-preview" style="width: 80px; height: 80px; border-radius: 50%; margin: 15px auto; display:flex; align-items:center; justify-content:center; font-size:2rem; font-weight:bold; color:#fff; overflow:hidden;"></div>
         <div style="display:flex; align-items:center; justify-content:center; gap:8px; margin-bottom:4px;">
             <h3 id="profile-name"></h3>
-            <span id="profile-dev-badge" class="dev-badge" style="display:none;">🛠️ Разработчик</span>
+            <span id="profile-dev-badge" class="dev-badge" style="display:none;">🛠️ DEV</span>
         </div>
         <p id="profile-tag" style="color: var(--badge-blue); font-size: 0.9rem; margin-bottom: 15px;"></p>
         
@@ -846,10 +1032,12 @@ HTML_TEMPLATE = """
         <input type="file" id="profile-file" accept="image/*">
         
         <button class="btn-primary" onclick="uploadUserAvatar()">Сохранить аватарку</button>
-        <button class="btn-cancel" onclick="logout()" style="color: var(--danger-red); margin-top: 8px;">Выйти из аккаунта 🚪</button>
+        <button class="btn-cancel" onclick="logout()" style="color: var(--danger-red); margin-top: 8px;">Выйти из Cipher 🚪</button>
         <button class="btn-cancel" onclick="document.getElementById('profile-modal').style.display='none'">Закрыть</button>
     </div>
 </div>
+
+<input type="file" id="media-file-input" style="display: none;" onchange="handleFileUpload(this.files[0])">
 
 <div id="app-container">
     <div id="sidebar">
@@ -881,7 +1069,7 @@ HTML_TEMPLATE = """
         <div id="chat-placeholder" class="empty-placeholder">
             <div style="font-size: 3rem;">⚡</div>
             <h3 style="color:#fff;">Добро пожаловать в Cipher</h3>
-            <p>Выберите чат слева или воспользуйтесь поиском, чтобы начать диалог</p>
+            <p>Выберите диалог или найдите контакт через поиск 🔍</p>
         </div>
 
         <div id="chat-content" style="display:none; flex-direction:column; height:100%;">
@@ -897,12 +1085,27 @@ HTML_TEMPLATE = """
                 </div>
             </div>
 
+            <div id="pinned-banner" class="pinned-banner">
+                <div><span class="label">📌 Закреплено:</span><span id="pinned-text">Сообщение</span></div>
+                <span style="color:var(--text-sub);" onclick="unpinMessage(event)">✕</span>
+            </div>
+
             <div class="messages-container" id="messages"></div>
 
-            <div class="input-bar">
-                <div class="input-wrapper">
-                    <input type="text" id="msg-input" placeholder="Напишите сообщение в Cipher..." onkeydown="if(event.key==='Enter') sendMsg()">
+            <div id="action-banner" class="action-banner">
+                <div>
+                    <span class="title" id="action-title">Ответ на сообщение</span>
+                    <div id="action-text" style="color:var(--text-sub); font-size:0.78rem; margin-top:2px;">Текст...</div>
                 </div>
+                <span class="action-close" onclick="cancelAction()">✕</span>
+            </div>
+
+            <div class="input-bar">
+                <button class="bar-btn" title="Прикрепить фото/файл" onclick="document.getElementById('media-file-input').click()">📎</button>
+                <div class="input-wrapper">
+                    <input type="text" id="msg-input" placeholder="Сообщение..." oninput="handleTyping()" onkeydown="if(event.key==='Enter') sendMsg()">
+                </div>
+                <button class="bar-btn" id="voice-btn" title="Голосовое сообщение" onclick="toggleVoiceRecord()">🎙️</button>
                 <button class="send-btn" onclick="sendMsg()">➤</button>
             </div>
         </div>
@@ -916,6 +1119,15 @@ HTML_TEMPLATE = """
     let ws = null;
     let chatsList = [];
     let onlineUsers = [];
+    let currentMessages = [];
+    let selectedMsg = null;
+    let replyMsg = null;
+    let editMsg = null;
+
+    let mediaRecorder = null;
+    let audioChunks = [];
+    let isRecording = false;
+    let typingTimeout = null;
 
     const DEV_USERS = ["milesconxxwow", "miles"];
     function checkIsDev(uname) {
@@ -951,6 +1163,9 @@ HTML_TEMPLATE = """
             document.getElementById("auth-modal").style.display = "none";
             startApp();
         }
+        document.addEventListener("click", () => {
+            document.getElementById("msg-menu").style.display = "none";
+        });
     };
 
     function toggleAuth() {
@@ -1030,23 +1245,29 @@ HTML_TEMPLATE = """
             if (data.type === "online_list") {
                 onlineUsers = data.users;
                 renderSidebar();
+            } else if (data.type === "typing" && data.sender === currentTarget) {
+                document.getElementById("header-sub").innerText = "печатает...";
+                clearTimeout(typingTimeout);
+                typingTimeout = setTimeout(() => {
+                    document.getElementById("header-sub").innerText = currentTarget.startsWith("#") ? "Канал" : "@" + currentTarget;
+                }, 2000);
             } else if (data.type === "msg") {
                 const isGroup = data.target.startsWith("#");
                 const chatKey = isGroup ? data.target : data.sender_username;
                 
                 if (currentTarget === chatKey || (isGroup && currentTarget === data.target)) {
-                    appendMessage(data, false);
+                    currentMessages.push(data);
+                    renderAllMessages();
                 }
                 fetchUserChats();
+            } else if (data.type === "edit_msg" || data.type === "delete_msg" || data.type === "reaction" || data.type === "pin") {
+                loadHistory();
             }
         };
 
         fetchUserChats().then(() => {
-            if (currentTarget && currentTarget !== "Общий чат") {
-                selectChat(currentTarget);
-            } else if (chatsList.length > 0) {
-                selectChat(chatsList[0].key);
-            }
+            if (currentTarget) selectChat(currentTarget);
+            else if (chatsList.length > 0) selectChat(chatsList[0].key);
         });
     }
 
@@ -1054,10 +1275,7 @@ HTML_TEMPLATE = """
         document.getElementById("profile-name").innerText = user.display_name;
         document.getElementById("profile-tag").innerText = "@" + user.username;
         renderAvatarEl(document.getElementById("profile-avatar-preview"), user.display_name, user.avatar_url);
-        
-        if (checkIsDev(user.username)) {
-            document.getElementById("profile-dev-badge").style.display = "inline-flex";
-        }
+        if (checkIsDev(user.username)) document.getElementById("profile-dev-badge").style.display = "inline-flex";
         document.getElementById("profile-modal").style.display = "flex";
     }
 
@@ -1116,7 +1334,7 @@ HTML_TEMPLATE = """
 
     function renderSearchResults(results) {
         const list = document.getElementById("chat-list");
-        list.innerHTML = `<div style="padding:10px 18px; font-size:0.75rem; color:var(--text-sub);">РЕЗУЛЬТАТЫ ПОИСКА</div>`;
+        list.innerHTML = `<div style="padding:10px 18px; font-size:0.75rem; color:var(--text-sub);">РЕЗУЛЬТАТЫ ПОИСКА CIPHER</div>`;
         if (results.length === 0) {
             list.innerHTML += `<div style="padding:18px; text-align:center; color:var(--text-sub); font-size:0.85rem;">Ничего не найдено</div>`;
             return;
@@ -1164,7 +1382,7 @@ HTML_TEMPLATE = """
         list.innerHTML = "";
         
         if (chatsList.length === 0) {
-            list.innerHTML = `<div style="padding:30px 20px; text-align:center; color:var(--text-sub); font-size:0.85rem;">Нет активных чатов.<br>Используйте поиск 🔍 или создайте канал ➕</div>`;
+            list.innerHTML = `<div style="padding:30px 20px; text-align:center; color:var(--text-sub); font-size:0.85rem;">Нет чатов.<br>Создайте канал ➕ или найдите друга 🔍</div>`;
             return;
         }
 
@@ -1218,36 +1436,221 @@ HTML_TEMPLATE = """
 
         document.body.classList.add("in-chat");
         renderSidebar();
-
-        const res = await fetch(`/api/history?user=${encodeURIComponent(user.username)}&target=${encodeURIComponent(key)}`);
-        const history = await res.json();
-        
-        const box = document.getElementById("messages");
-        box.innerHTML = "";
-        history.forEach(m => appendMessage(m, m.sender_username === user.username));
+        await loadHistory();
     }
 
-    function appendMessage(m, isMine) {
-        const box = document.getElementById("messages");
-        const row = document.createElement("div");
-        row.className = `msg-row ${isMine ? 'mine' : 'theirs'}`;
-        const isMsgDev = checkIsDev(m.sender_username);
+    async function loadHistory() {
+        if (!currentTarget) return;
+        const res = await fetch(`/api/history?user=${encodeURIComponent(user.username)}&target=${encodeURIComponent(currentTarget)}`);
+        currentMessages = await res.json();
+        renderAllMessages();
+    }
 
-        row.innerHTML = `
-            ${!isMine && m.avatar ? `<img src="${m.avatar}" class="msg-avatar">` : ''}
-            <div class="bubble">
-                ${!isMine ? `
-                    <div class="bubble-header">
-                        <span>${m.sender_name}</span>
-                        ${isMsgDev ? '<span class="dev-badge">DEV</span>' : ''}
-                        <span style="font-weight:normal; opacity:0.6; font-size:0.7rem;">@${m.sender_username}</span>
-                    </div>` : ''}
-                <div>${escapeHtml(m.text)}</div>
-                <div class="bubble-footer"><span class="bubble-time">${m.time}</span></div>
-            </div>
-        `;
-        box.appendChild(row);
+    function renderAllMessages() {
+        const box = document.getElementById("messages");
+        box.innerHTML = "";
+        currentMessages.forEach(m => {
+            const isMine = m.sender_username === user.username;
+            const row = document.createElement("div");
+            row.className = `msg-row ${isMine ? 'mine' : 'theirs'}`;
+
+            let contentHtml = "";
+            if (m.reply_to_text) {
+                contentHtml += `<div class="bubble-reply"><span class="reply-user">@${escapeHtml(m.reply_to_sender)}</span>: ${escapeHtml(m.reply_to_text)}</div>`;
+            }
+
+            if (m.msg_type === "image") {
+                contentHtml += `<img src="${m.file_url}" class="bubble-img">`;
+            } else if (m.msg_type === "voice") {
+                contentHtml += `
+                    <div class="audio-player">
+                        <audio controls src="${m.file_url}"></audio>
+                    </div>`;
+            } else if (m.msg_type === "document") {
+                contentHtml += `<a href="${m.file_url}" download="${m.file_name}" class="file-attachment">📄 ${escapeHtml(m.file_name || 'Скачать файл')}</a>`;
+            }
+
+            if (m.text) {
+                contentHtml += `<div>${escapeHtml(m.text)}</div>`;
+            }
+
+            let reactionsHtml = "";
+            if (m.reactions && Object.keys(m.reactions).length > 0) {
+                reactionsHtml = `<div class="reactions-row">`;
+                for (const [emo, count] of Object.entries(m.reactions)) {
+                    reactionsHtml += `<div class="reaction-chip" onclick="event.stopPropagation(); toggleReaction(${m.id}, '${emo}')">${emo} ${count}</div>`;
+                }
+                reactionsHtml += `</div>`;
+            }
+
+            const isMsgDev = checkIsDev(m.sender_username);
+
+            row.innerHTML = `
+                ${!isMine && m.avatar ? `<img src="${m.avatar}" class="msg-avatar">` : ''}
+                <div class="bubble" oncontextmenu="event.preventDefault(); openMsgMenu(event, ${m.id}, ${isMine})">
+                    ${!isMine ? `
+                        <div class="bubble-header">
+                            <span>${m.sender_name}</span>
+                            ${isMsgDev ? '<span class="dev-badge">DEV</span>' : ''}
+                            <span style="font-weight:normal; opacity:0.6; font-size:0.7rem;">@${m.sender_username}</span>
+                        </div>` : ''}
+                    ${contentHtml}
+                    ${reactionsHtml}
+                    <div class="bubble-footer">
+                        ${m.is_edited ? '<span style="font-size:0.65rem; opacity:0.6;">(изм.)</span>' : ''}
+                        <span class="bubble-time">${m.time}</span>
+                    </div>
+                </div>
+            `;
+            box.appendChild(row);
+        });
         box.scrollTop = box.scrollHeight;
+    }
+
+    function openMsgMenu(e, id, isMine) {
+        selectedMsg = currentMessages.find(m => m.id === id);
+        if (!selectedMsg) return;
+
+        const menu = document.getElementById("msg-menu");
+        menu.style.left = `${Math.min(e.clientX, window.innerWidth - 180)}px`;
+        menu.style.top = `${Math.min(e.clientY, window.innerHeight - 200)}px`;
+        menu.style.display = "flex";
+
+        document.getElementById("menu-edit-btn").style.display = isMine && selectedMsg.msg_type === "text" ? "flex" : "none";
+        document.getElementById("menu-del-btn").style.display = isMine ? "flex" : "none";
+        e.stopPropagation();
+    }
+
+    function sendReaction(emoji) {
+        if (!selectedMsg || !ws) return;
+        ws.send(JSON.stringify({
+            action: "reaction",
+            msg_id: selectedMsg.id,
+            emoji: emoji,
+            target: currentTarget
+        }));
+        document.getElementById("msg-menu").style.display = "none";
+    }
+
+    function toggleReaction(msgId, emoji) {
+        if (!ws) return;
+        ws.send(JSON.stringify({
+            action: "reaction",
+            msg_id: msgId,
+            emoji: emoji,
+            target: currentTarget
+        }));
+    }
+
+    function startReply() {
+        replyMsg = selectedMsg;
+        editMsg = null;
+        document.getElementById("action-title").innerText = `Ответ пользователю @${replyMsg.sender_username}`;
+        document.getElementById("action-text").innerText = replyMsg.text || (replyMsg.msg_type === 'image' ? '📷 Фото' : '🎙️ Голосовое');
+        document.getElementById("action-banner").style.display = "flex";
+        document.getElementById("msg-input").focus();
+    }
+
+    function startEdit() {
+        editMsg = selectedMsg;
+        replyMsg = null;
+        document.getElementById("action-title").innerText = "Редактирование сообщения";
+        document.getElementById("action-text").innerText = editMsg.text;
+        document.getElementById("action-banner").style.display = "flex";
+        document.getElementById("msg-input").value = editMsg.text;
+        document.getElementById("msg-input").focus();
+    }
+
+    function cancelAction() {
+        replyMsg = null;
+        editMsg = null;
+        document.getElementById("action-banner").style.display = "none";
+        document.getElementById("msg-input").value = "";
+    }
+
+    function deleteMessage() {
+        if (!selectedMsg || !ws) return;
+        if (confirm("Удалить это сообщение?")) {
+            ws.send(JSON.stringify({
+                action: "delete",
+                msg_id: selectedMsg.id,
+                target: currentTarget
+            }));
+        }
+    }
+
+    function pinMessage() {
+        if (!selectedMsg) return;
+        const banner = document.getElementById("pinned-banner");
+        document.getElementById("pinned-text").innerText = selectedMsg.text || "Медиафайл";
+        banner.style.display = "flex";
+    }
+
+    function unpinMessage(e) {
+        e.stopPropagation();
+        document.getElementById("pinned-banner").style.display = "none";
+    }
+
+    function handleTyping() {
+        if (ws && currentTarget && !currentTarget.startsWith("#")) {
+            ws.send(JSON.stringify({ action: "typing", target: currentTarget }));
+        }
+    }
+
+    async function handleFileUpload(file) {
+        if (!file) return;
+        const form = new FormData();
+        form.append("file", file);
+
+        const res = await fetch("/api/upload_file", { method: "POST", body: form });
+        const data = await res.json();
+        if (data.status === "ok") {
+            const timeStr = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+            const payload = {
+                action: "send",
+                sender_username: user.username,
+                sender_name: user.display_name,
+                target: currentTarget,
+                text: "",
+                msg_type: data.msg_type,
+                file_url: data.url,
+                file_name: data.file_name,
+                avatar: user.avatar_url || "",
+                time: timeStr
+            };
+            ws.send(JSON.stringify(payload));
+        }
+    }
+
+    async function toggleVoiceRecord() {
+        const btn = document.getElementById("voice-btn");
+        if (!isRecording) {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                mediaRecorder = new MediaRecorder(stream);
+                audioChunks = [];
+
+                mediaRecorder.ondataavailable = e => audioChunks.push(e.data);
+                mediaRecorder.onstop = async () => {
+                    const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
+                    const file = new File([audioBlob], "voice_message.webm", { type: "audio/webm" });
+                    await handleFileUpload(file);
+                    stream.getTracks().forEach(t => t.stop());
+                };
+
+                mediaRecorder.start();
+                isRecording = true;
+                btn.classList.add("recording");
+                btn.title = "Нажмите, чтобы отправить голосовое";
+            } catch (err) {
+                alert("Нет доступа к микрофону");
+            }
+        } else {
+            mediaRecorder.stop();
+            isRecording = false;
+            btn.classList.remove("recording");
+            btn.title = "Голосовое сообщение";
+        }
     }
 
     function sendMsg() {
@@ -1255,23 +1658,39 @@ HTML_TEMPLATE = """
         const text = input.value.trim();
         if (!text || !ws || !currentTarget) return;
 
+        if (editMsg) {
+            ws.send(JSON.stringify({
+                action: "edit",
+                msg_id: editMsg.id,
+                text: text,
+                target: currentTarget
+            }));
+            cancelAction();
+            return;
+        }
+
         const timeStr = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
         const payload = {
+            action: "send",
             sender_username: user.username,
             sender_name: user.display_name,
             target: currentTarget,
             text: text,
+            msg_type: "text",
+            reply_to_id: replyMsg ? replyMsg.id : 0,
+            reply_to_text: replyMsg ? (replyMsg.text || "Медиа") : "",
+            reply_to_sender: replyMsg ? replyMsg.sender_username : "",
             avatar: user.avatar_url || "",
             time: timeStr
         };
 
-        appendMessage(payload, true);
         ws.send(JSON.stringify(payload));
         input.value = "";
-        fetchUserChats();
+        cancelAction();
     }
 
     function escapeHtml(str) {
+        if (!str) return "";
         return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
     }
 </script>
@@ -1290,33 +1709,109 @@ async def ws_endpoint(websocket: WebSocket, username: str):
         while True:
             raw = await websocket.receive_text()
             data = json.loads(raw)
+            action = data.get("action", "send")
             target = data.get("target")
-            text = data.get("text")
+
+            if action == "typing":
+                await manager.send_to_user({"type": "typing", "sender": username}, target)
+                continue
+
+            elif action == "reaction":
+                msg_id = data.get("msg_id")
+                emoji = data.get("emoji")
+                async with aiosqlite.connect(DB_PATH) as db:
+                    cur = await db.execute("SELECT reactions FROM messages WHERE id = ?", (msg_id,))
+                    row = await cur.fetchone()
+                    if row:
+                        reacts = json.loads(row[0] or "{}")
+                        reacts[emoji] = reacts.get(emoji, 0) + 1
+                        await db.execute("UPDATE messages SET reactions = ? WHERE id = ?", (json.dumps(reacts), msg_id))
+                        await db.commit()
+                
+                payload = {"type": "reaction", "msg_id": msg_id, "target": target}
+                if target.startswith("#"):
+                    await manager.broadcast_channel(payload)
+                else:
+                    await manager.send_to_user(payload, target)
+                    await manager.send_to_user(payload, username)
+                continue
+
+            elif action == "edit":
+                msg_id = data.get("msg_id")
+                new_text = data.get("text")
+                async with aiosqlite.connect(DB_PATH) as db:
+                    await db.execute("UPDATE messages SET text = ?, is_edited = 1 WHERE id = ? AND sender_username = ?", (new_text, msg_id, username))
+                    await db.commit()
+                
+                payload = {"type": "edit_msg", "msg_id": msg_id, "text": new_text, "target": target}
+                if target.startswith("#"):
+                    await manager.broadcast_channel(payload)
+                else:
+                    await manager.send_to_user(payload, target)
+                    await manager.send_to_user(payload, username)
+                continue
+
+            elif action == "delete":
+                msg_id = data.get("msg_id")
+                async with aiosqlite.connect(DB_PATH) as db:
+                    await db.execute("UPDATE messages SET is_deleted = 1 WHERE id = ? AND sender_username = ?", (msg_id, username))
+                    await db.commit()
+                
+                payload = {"type": "delete_msg", "msg_id": msg_id, "target": target}
+                if target.startswith("#"):
+                    await manager.broadcast_channel(payload)
+                else:
+                    await manager.send_to_user(payload, target)
+                    await manager.send_to_user(payload, username)
+                continue
+
+            # Default: action == "send"
+            text = data.get("text", "")
+            msg_type = data.get("msg_type", "text")
+            file_url = data.get("file_url", "")
+            file_name = data.get("file_name", "")
+            reply_id = data.get("reply_to_id", 0)
+            reply_text = data.get("reply_to_text", "")
+            reply_sender = data.get("reply_to_sender", "")
             time_str = datetime.now().strftime("%H:%M")
 
+            msg_id = 0
             async with aiosqlite.connect(DB_PATH) as db:
-                await db.execute(
-                    """INSERT INTO messages (sender_username, sender_name, target, text, timestamp, avatar_url) 
-                       VALUES (?, ?, ?, ?, ?, ?)""",
-                    (username, data.get("sender_name", username), target, text, time_str, data.get("avatar", ""))
+                cur = await db.execute(
+                    """INSERT INTO messages (sender_username, sender_name, target, text, msg_type, file_url, file_name, 
+                                             reply_to_id, reply_to_text, reply_to_sender, timestamp, avatar_url) 
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (username, data.get("sender_name", username), target, text, msg_type, file_url, file_name, 
+                     reply_id, reply_text, reply_sender, time_str, data.get("avatar", ""))
                 )
                 await db.commit()
+                msg_id = cur.lastrowid
 
             msg_out = {
                 "type": "msg",
+                "id": msg_id,
                 "sender_username": username,
                 "sender_name": data.get("sender_name", username),
                 "target": target,
                 "text": text,
+                "msg_type": msg_type,
+                "file_url": file_url,
+                "file_name": file_name,
+                "reply_to_id": reply_id,
+                "reply_to_text": reply_text,
+                "reply_to_sender": reply_sender,
+                "reactions": {},
+                "is_edited": False,
                 "time": time_str,
                 "avatar": data.get("avatar", ""),
                 "is_dev": is_dev(username)
             }
 
             if target.startswith("#"):
-                await manager.broadcast_channel(msg_out, sender_username=username)
+                await manager.broadcast(msg_out)
             else:
                 await manager.send_to_user(msg_out, recipient_username=target)
+                await manager.send_to_user(msg_out, recipient_username=username)
 
     except WebSocketDisconnect:
         await manager.disconnect(username)
