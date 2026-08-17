@@ -302,7 +302,6 @@ async def update_profile(data: UpdateProfileModel):
         old_email = user_row[0].lower()
         pwd_hash = user_row[1]
 
-        # Если почта меняется — требуем пароль
         if new_email != old_email:
             if not pwd:
                 return {"status": "error", "message": "Для смены Email введите текущий пароль"}
@@ -391,7 +390,6 @@ async def create_channel(tag: str = Form(...), name: str = Form(...), desc: str 
         if await cur.fetchone():
             return {"status": "error", "message": "Канал с таким тегом уже существует"}
 
-        # При создании в подписчиках только создатель
         initial_members = json.dumps([creator_uname])
         created_at = datetime.now().strftime("%Y-%m-%d %H:%M")
         await db.execute(
@@ -432,6 +430,23 @@ async def update_channel(tag: str = Form(...), name: str = Form(...), desc: str 
 
     return {"status": "ok", "name": name.strip(), "description": desc.strip(), "avatar_url": avatar_url}
 
+@app.post("/api/delete_channel")
+async def delete_channel(data: ChannelMemberModel):
+    clean_tag = data.channel_tag.strip().lstrip("#").lower()
+    req_uname = data.username.strip().lower()
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT creator_username FROM channels WHERE LOWER(channel_tag) = LOWER(?)", (clean_tag,))
+        row = await cur.fetchone()
+        if not row:
+            return {"status": "error", "message": "Канал не найден"}
+        if row[0].lower() != req_uname and not is_dev(req_uname):
+            return {"status": "error", "message": "Только создатель может удалить канал"}
+
+        await db.execute("DELETE FROM channels WHERE LOWER(channel_tag) = LOWER(?)", (clean_tag,))
+        await db.execute("DELETE FROM messages WHERE LOWER(target) = LOWER(?)", (f"#{clean_tag}",))
+        await db.commit()
+    return {"status": "ok"}
+
 @app.post("/api/join_channel")
 async def join_channel(data: ChannelMemberModel):
     clean_tag = data.channel_tag.strip().lstrip("#").lower()
@@ -459,6 +474,10 @@ async def leave_channel(data: ChannelMemberModel):
         if not row:
             return {"status": "error", "message": "Канал не найден"}
         
+        # Создатель не может покинуть свой канал, он может только удалить его
+        if row[1].lower() == uname:
+            return {"status": "error", "message": "Создатель не может покинуть канал. Вы можете удалить его в настройках."}
+
         members = json.loads(row[0] or "[]")
         if uname in members:
             members.remove(uname)
@@ -545,14 +564,12 @@ async def get_user_chats(username: str):
         cur_blk = await db.execute("SELECT blocked FROM blocks WHERE LOWER(blocker) = LOWER(?)", (uname,))
         blocked_list = [r[0].lower() for r in await cur_blk.fetchall()]
 
-        # Каналы (показываем только те, где пользователь подписан или является создателем)
         cur_ch = await db.execute("SELECT channel_tag, name, avatar_url, pinned_msg_id, description, creator_username, members FROM channels")
         for ch in await cur_ch.fetchall():
             tag_key = f"#{ch[0]}"
             creator = ch[5]
             members = [m.lower() for m in json.loads(ch[6] or "[]")]
             
-            # Показываем в списке только если подписан
             if uname not in members and creator.lower() != uname and not is_dev(uname):
                 continue
 
@@ -584,7 +601,6 @@ async def get_user_chats(username: str):
                 "is_blocked": False
             })
 
-        # Приватные диалоги (только переписки текущего пользователя)
         cur_peers = await db.execute("""
             SELECT DISTINCT 
                 CASE WHEN LOWER(sender_username) = LOWER(?) THEN target ELSE sender_username END AS peer
@@ -1511,10 +1527,10 @@ HTML_TEMPLATE = """
 <div id="channel-modal" class="modal-overlay" style="display: none;">
     <div class="card-modal">
         <h2>Создать канал</h2>
-        <p class="subtitle">Публичное пространство для публикаций и новостей</p>
+        <p class="subtitle">Публичное пространство для публикаций</p>
         
         <input type="text" id="chan-name" placeholder="Название канала">
-        <input type="text" id="chan-tag" placeholder="Уникальный тег (например, dev, news)">
+        <input type="text" id="chan-tag" placeholder="Уникальный тег (например, news, dev)">
         <textarea id="chan-desc" rows="2" placeholder="Описание канала..."></textarea>
         <label style="font-size: 0.8rem; color: var(--text-sub); display: block; margin-bottom: 6px;">Аватарка:</label>
         <input type="file" id="chan-file" accept="image/*">
@@ -1527,7 +1543,7 @@ HTML_TEMPLATE = """
 <div id="edit-channel-modal" class="modal-overlay" style="display: none;">
     <div class="card-modal">
         <h2>Настройки канала</h2>
-        <p class="subtitle">Изменение информации и управление участниками</p>
+        <p class="subtitle">Изменение информации, участников и удаление</p>
         
         <input type="text" id="edit-chan-name" placeholder="Название канала">
         <textarea id="edit-chan-desc" rows="2" placeholder="Описание канала..."></textarea>
@@ -1543,6 +1559,7 @@ HTML_TEMPLATE = """
         </div>
 
         <button class="btn-primary" onclick="saveChannelEdit()">Сохранить изменения</button>
+        <button class="btn-primary" style="background:#ef4444; margin-top:8px;" onclick="deleteChannel()">🗑️ Удалить канал навсегда</button>
         <button class="btn-cancel" onclick="document.getElementById('edit-channel-modal').style.display='none'">Закрыть</button>
     </div>
 </div>
@@ -2102,6 +2119,26 @@ HTML_TEMPLATE = """
         }
     }
 
+    async function deleteChannel() {
+        if (!confirm("Вы уверены, что хотите удалить этот канал навсегда? Это действие необратимо.")) return;
+        const res = await fetch("/api/delete_channel", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({ channel_tag: currentTarget, username: user.username })
+        });
+        const data = await res.json();
+        if (data.status === "ok") {
+            document.getElementById("edit-channel-modal").style.display = "none";
+            localStorage.removeItem("messenger_target");
+            currentTarget = "";
+            document.getElementById("chat-content").style.display = "none";
+            document.getElementById("chat-placeholder").style.display = "flex";
+            await fetchUserChats();
+        } else {
+            alert(data.message);
+        }
+    }
+
     async function toggleChannelSubscription() {
         if (!currentTarget.startsWith("#") || !currentChannelData) return;
         const endpoint = currentChannelData.is_member ? "/api/leave_channel" : "/api/join_channel";
@@ -2114,6 +2151,8 @@ HTML_TEMPLATE = """
         if (data.status === "ok") {
             await fetchUserChats();
             selectChat(currentTarget);
+        } else {
+            alert(data.message);
         }
     }
 
@@ -2376,7 +2415,7 @@ HTML_TEMPLATE = """
                 const isOwner = (data.creator.toLowerCase() === user.username.toLowerCase()) || is_dev(user.username);
                 
                 settingsBtn.style.display = isOwner ? "flex" : "none";
-                subBtn.style.display = isOwner ? "none" : "block";
+                subBtn.style.display = "block";
                 subBtn.className = `header-sub-btn ${data.is_member ? 'btn-leave' : 'btn-join'}`;
                 subBtn.innerText = data.is_member ? "Покинуть" : "Подписаться";
 
@@ -2384,8 +2423,10 @@ HTML_TEMPLATE = """
                     inputBar.style.display = "flex";
                     restrictedBar.style.display = "none";
                 } else {
-                    inputBar.style.display = "none";
-                    restrictedBar.style.display = "block";
+                    inputBar.style.display = data.is_member ? "none" : "none";
+                    restrictedBar.style.display = data.is_member ? "block" : "none";
+                    if (!data.is_member) restrictedBar.innerText = "📢 Вы не подписаны на этот канал";
+                    else restrictedBar.innerText = "📢 Только создатель канала может публиковать посты";
                 }
             } else {
                 currentChannelData = null;
@@ -2815,7 +2856,6 @@ async def ws_endpoint(websocket: WebSocket, username: str):
             forward_from = data.get("forward_from", "")
             time_str = datetime.now().strftime("%H:%M")
 
-            # Если сообщение в канал — проверяем, что отправитель является создателем канала
             if target.startswith("#"):
                 clean_tag = target.lstrip("#").lower()
                 async with aiosqlite.connect(DB_PATH) as db:
