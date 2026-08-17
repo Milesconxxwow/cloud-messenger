@@ -216,9 +216,18 @@ async def upload_file_endpoint(file: UploadFile = File(...)):
     with open(file_path, "wb") as buf:
         shutil.copyfileobj(file.file, buf)
 
-    is_img = ext in ["jpg", "jpeg", "png", "gif", "webp"]
-    is_audio = ext in ["webm", "ogg", "mp3", "wav", "m4a"]
-    file_type = "image" if is_img else ("voice" if is_audio else "document")
+    is_img = ext in ["jpg", "jpeg", "png", "gif", "webp", "bmp", "svg"]
+    is_vid = ext in ["mp4", "webm", "mov", "avi", "mkv"]
+    is_audio = ext in ["webm", "ogg", "mp3", "wav", "m4a", "aac"]
+
+    if is_img:
+        file_type = "image"
+    elif is_vid:
+        file_type = "video"
+    elif is_audio:
+        file_type = "voice"
+    else:
+        file_type = "document"
 
     return {
         "status": "ok",
@@ -331,7 +340,10 @@ async def get_user_chats(username: str):
             last = await cur_last.fetchone()
             last_text = "Канал создан"
             if last:
-                last_text = "🎙️ Голосовое" if last[1] == "voice" else ("📷 Фотография" if last[1] == "image" else (last[0] or "📎 Файл"))
+                if last[1] == "voice": last_text = "🎙️ Голосовое"
+                elif last[1] == "image": last_text = "📷 Фотография"
+                elif last[1] == "video": last_text = "🎬 Видео"
+                else: last_text = last[0] or "📎 Файл"
 
             chats.append({
                 "key": tag_key,
@@ -371,7 +383,10 @@ async def get_user_chats(username: str):
             last = await cur_last.fetchone()
             last_text = ""
             if last:
-                last_text = "🎙️ Голосовое" if last[1] == "voice" else ("📷 Фотография" if last[1] == "image" else (last[0] or "📎 Файл"))
+                if last[1] == "voice": last_text = "🎙️ Голосовое"
+                elif last[1] == "image": last_text = "📷 Фотография"
+                elif last[1] == "video": last_text = "🎬 Видео"
+                else: last_text = last[0] or "📎 Файл"
 
             chats.append({
                 "key": p,
@@ -390,19 +405,15 @@ async def get_user_chats(username: str):
 
 @app.get("/api/search")
 async def search(q: str):
-    """Полнотекстовый поиск по пользователям и каналам на Python (поддерживает русский язык и регистр)"""
     search_term = q.strip().lstrip('@').lstrip('#').lower()
     if not search_term:
         return {"results": []}
 
     results = []
     async with aiosqlite.connect(DB_PATH) as db:
-        # Поиск пользователей
         cur_u = await db.execute("SELECT username, display_name, avatar_url FROM users")
         for r in await cur_u.fetchall():
-            uname = r[0].lower()
-            dname = r[1].lower()
-            if search_term in uname or search_term in dname:
+            if search_term in r[0].lower() or search_term in r[1].lower():
                 results.append({
                     "type": "user",
                     "key": r[0],
@@ -412,13 +423,9 @@ async def search(q: str):
                     "is_dev": is_dev(r[0])
                 })
 
-        # Поиск каналов
         cur_c = await db.execute("SELECT channel_tag, name, avatar_url, description FROM channels")
         for r in await cur_c.fetchall():
-            ctag = r[0].lower()
-            cname = r[1].lower()
-            cdesc = (r[3] or "").lower()
-            if search_term in ctag or search_term in cname or search_term in cdesc:
+            if search_term in r[0].lower() or search_term in r[1].lower() or search_term in (r[3] or "").lower():
                 results.append({
                     "type": "channel",
                     "key": f"#{r[0]}",
@@ -870,9 +877,21 @@ HTML_TEMPLATE = """
         
         .bubble-img {
             max-width: 100%;
-            border-radius: 8px;
+            max-height: 320px;
+            border-radius: 10px;
             margin-top: 4px;
             display: block;
+            object-fit: cover;
+        }
+
+        .bubble-video {
+            max-width: 100%;
+            max-height: 320px;
+            border-radius: 10px;
+            margin-top: 4px;
+            display: block;
+            outline: none;
+            background: #000;
         }
 
         .audio-player {
@@ -887,7 +906,7 @@ HTML_TEMPLATE = """
             display: flex;
             align-items: center;
             gap: 8px;
-            background: rgba(0,0,0,0.2);
+            background: rgba(0,0,0,0.25);
             padding: 8px 12px;
             border-radius: 8px;
             text-decoration: none;
@@ -1119,7 +1138,7 @@ HTML_TEMPLATE = """
     </div>
 </div>
 
-<input type="file" id="media-file-input" style="display: none;" onchange="handleFileUpload(this.files[0])">
+<input type="file" id="media-file-input" style="display: none;" accept="image/*,video/*,audio/*,application/*" onchange="handleFileUpload(this.files[0])">
 
 <div id="app-container">
     <div id="sidebar">
@@ -1183,7 +1202,7 @@ HTML_TEMPLATE = """
             </div>
 
             <div class="input-bar">
-                <button class="bar-btn" title="Прикрепить фото/файл" onclick="document.getElementById('media-file-input').click()">📎</button>
+                <button class="bar-btn" title="Прикрепить фото, видео или файл" onclick="document.getElementById('media-file-input').click()">📎</button>
                 <div class="input-wrapper">
                     <input type="text" id="msg-input" placeholder="Сообщение..." oninput="handleTyping()" onkeydown="if(event.key==='Enter') sendMsg()">
                 </div>
@@ -1338,7 +1357,7 @@ HTML_TEMPLATE = """
                 const isGroup = data.target.startsWith("#");
                 const chatKey = isGroup ? data.target : data.sender_username;
                 
-                if (currentTarget === chatKey || (isGroup && currentTarget === data.target)) {
+                if (currentTarget === chatKey || (isGroup && currentTarget === data.target) || (data.sender_username === user.username && data.target === currentTarget)) {
                     currentMessages.push(data);
                     renderAllMessages();
                 }
@@ -1585,7 +1604,10 @@ HTML_TEMPLATE = """
             }
 
             if (m.msg_type === "image") {
-                contentHtml += `<img src="${m.file_url}" class="bubble-img">`;
+                contentHtml += `<img src="${m.file_url}" class="bubble-img" onclick="window.open('${m.file_url}', '_blank')">`;
+            } else if (m.msg_type === "video") {
+                contentHtml += `
+                    <video controls src="${m.file_url}" class="bubble-video"></video>`;
             } else if (m.msg_type === "voice") {
                 contentHtml += `
                     <div class="audio-player">
@@ -1671,7 +1693,7 @@ HTML_TEMPLATE = """
         replyMsg = selectedMsg;
         editMsg = null;
         document.getElementById("action-title").innerText = `Ответ пользователю @${replyMsg.sender_username}`;
-        document.getElementById("action-text").innerText = replyMsg.text || (replyMsg.msg_type === 'image' ? '📷 Фото' : '🎙️ Голосовое');
+        document.getElementById("action-text").innerText = replyMsg.text || (replyMsg.msg_type === 'image' ? '📷 Фото' : (replyMsg.msg_type === 'video' ? '🎬 Видео' : '🎙️ Голосовое'));
         document.getElementById("action-banner").style.display = "flex";
         document.getElementById("msg-input").focus();
     }
@@ -1723,7 +1745,7 @@ HTML_TEMPLATE = """
     }
 
     async function handleFileUpload(file) {
-        if (!file) return;
+        if (!file || !currentTarget) return;
         const form = new FormData();
         form.append("file", file);
 
@@ -1740,11 +1762,16 @@ HTML_TEMPLATE = """
                 msg_type: data.msg_type,
                 file_url: data.url,
                 file_name: data.file_name,
+                reply_to_id: replyMsg ? replyMsg.id : 0,
+                reply_to_text: replyMsg ? (replyMsg.text || "Медиа") : "",
+                reply_to_sender: replyMsg ? replyMsg.sender_username : "",
                 avatar: user.avatar_url || "",
                 time: timeStr
             };
             ws.send(JSON.stringify(payload));
+            cancelAction();
         }
+        document.getElementById("media-file-input").value = "";
     }
 
     async function toggleVoiceRecord() {
@@ -1802,6 +1829,8 @@ HTML_TEMPLATE = """
             target: currentTarget,
             text: text,
             msg_type: "text",
+            file_url: "",
+            file_name: "",
             reply_to_id: replyMsg ? replyMsg.id : 0,
             reply_to_text: replyMsg ? (replyMsg.text || "Медиа") : "",
             reply_to_sender: replyMsg ? replyMsg.sender_username : "",
@@ -1933,6 +1962,7 @@ async def ws_endpoint(websocket: WebSocket, username: str):
 
             if target.startswith("#"):
                 await manager.broadcast(msg_out)
+                await manager.send_to_user(msg_out, recipient_username=username)
             else:
                 async with aiosqlite.connect(DB_PATH) as db:
                     cur_block = await db.execute("SELECT id FROM blocks WHERE blocker = ? AND blocked = ?", (target, username))
