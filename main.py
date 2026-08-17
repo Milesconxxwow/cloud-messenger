@@ -80,7 +80,6 @@ async def init_db():
                 creator_username TEXT NOT NULL COLLATE NOCASE,
                 avatar_url TEXT DEFAULT '',
                 pinned_msg_id INTEGER DEFAULT 0,
-                is_group INTEGER DEFAULT 0,
                 members TEXT DEFAULT '[]',
                 created_at TEXT NOT NULL
             )
@@ -119,7 +118,6 @@ async def init_db():
         migrations = [
             ("users", "custom_status", "TEXT DEFAULT 'online'"),
             ("users", "last_seen", "TEXT DEFAULT ''"),
-            ("channels", "is_group", "INTEGER DEFAULT 0"),
             ("channels", "members", "TEXT DEFAULT '[]'"),
             ("messages", "forward_from", "TEXT DEFAULT ''"),
             ("messages", "is_read", "INTEGER DEFAULT 0"),
@@ -209,6 +207,12 @@ class UpdateProfileModel(BaseModel):
     username: str
     display_name: str
     email: str
+    password: str = ""
+
+class ChannelMemberModel(BaseModel):
+    channel_tag: str
+    username: str
+    requester: str = ""
 
 @app.post("/api/register")
 async def register(data: RegisterModel):
@@ -284,14 +288,30 @@ async def update_profile(data: UpdateProfileModel):
     uname = data.username.strip().lower()
     new_name = data.display_name.strip()
     new_email = data.email.strip().lower()
+    pwd = data.password.strip()
 
     if not new_name or not new_email:
         return {"status": "error", "message": "Имя и email не могут быть пустыми"}
 
     async with aiosqlite.connect(DB_PATH) as db:
-        cur_e = await db.execute("SELECT id FROM users WHERE LOWER(email) = LOWER(?) AND LOWER(username) != LOWER(?)", (new_email, uname))
-        if await cur_e.fetchone():
-            return {"status": "error", "message": "Этот Email уже занят другим аккаунтом"}
+        cur_u = await db.execute("SELECT email, password_hash FROM users WHERE LOWER(username) = LOWER(?)", (uname,))
+        user_row = await cur_u.fetchone()
+        if not user_row:
+            return {"status": "error", "message": "Пользователь не найден"}
+
+        old_email = user_row[0].lower()
+        pwd_hash = user_row[1]
+
+        # Если почта меняется — требуем пароль
+        if new_email != old_email:
+            if not pwd:
+                return {"status": "error", "message": "Для смены Email введите текущий пароль"}
+            if hash_password(pwd) != pwd_hash:
+                return {"status": "error", "message": "Неверный пароль от аккаунта"}
+
+            cur_e = await db.execute("SELECT id FROM users WHERE LOWER(email) = LOWER(?) AND LOWER(username) != LOWER(?)", (new_email, uname))
+            if await cur_e.fetchone():
+                return {"status": "error", "message": "Этот Email уже занят другим аккаунтом"}
 
         await db.execute("UPDATE users SET display_name = ?, email = ? WHERE LOWER(username) = LOWER(?)", (new_name, new_email, uname))
         await db.execute("UPDATE messages SET sender_name = ? WHERE LOWER(sender_username) = LOWER(?)", (new_name, uname))
@@ -350,7 +370,7 @@ async def update_status(data: StatusModel):
     return {"status": "ok"}
 
 @app.post("/api/create_channel")
-async def create_channel(tag: str = Form(...), name: str = Form(...), desc: str = Form(""), creator: str = Form(...), is_group: int = Form(0), members: str = Form("[]"), file: UploadFile = File(None)):
+async def create_channel(tag: str = Form(...), name: str = Form(...), desc: str = Form(""), creator: str = Form(...), file: UploadFile = File(None)):
     clean_tag = tag.strip().lstrip("#").lower()
     clean_name = name.strip()
     creator_uname = creator.strip().lower()
@@ -369,17 +389,108 @@ async def create_channel(tag: str = Form(...), name: str = Form(...), desc: str 
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("SELECT id FROM channels WHERE LOWER(channel_tag) = LOWER(?)", (clean_tag,))
         if await cur.fetchone():
-            return {"status": "error", "message": "Канал или группа с таким тегом уже существует"}
+            return {"status": "error", "message": "Канал с таким тегом уже существует"}
 
+        # При создании в подписчиках только создатель
+        initial_members = json.dumps([creator_uname])
         created_at = datetime.now().strftime("%Y-%m-%d %H:%M")
         await db.execute(
-            """INSERT INTO channels (channel_tag, name, description, creator_username, avatar_url, is_group, members, created_at) 
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (clean_tag, clean_name, desc, creator_uname, avatar_url, is_group, members, created_at)
+            """INSERT INTO channels (channel_tag, name, description, creator_username, avatar_url, members, created_at) 
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (clean_tag, clean_name, desc, creator_uname, avatar_url, initial_members, created_at)
         )
         await db.commit()
 
     return {"status": "ok", "channel_tag": clean_tag, "name": clean_name, "avatar_url": avatar_url}
+
+@app.post("/api/update_channel")
+async def update_channel(tag: str = Form(...), name: str = Form(...), desc: str = Form(""), requester: str = Form(...), file: UploadFile = File(None)):
+    clean_tag = tag.strip().lstrip("#").lower()
+    req_uname = requester.strip().lower()
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT creator_username, avatar_url FROM channels WHERE LOWER(channel_tag) = LOWER(?)", (clean_tag,))
+        row = await cur.fetchone()
+        if not row:
+            return {"status": "error", "message": "Канал не найден"}
+        if row[0].lower() != req_uname and not is_dev(req_uname):
+            return {"status": "error", "message": "Только создатель может менять канал"}
+
+        avatar_url = row[1]
+        if file and file.filename:
+            ext = file.filename.split(".")[-1].lower()
+            filename = f"chan_{clean_tag}_{uuid.uuid4().hex[:8]}.{ext}"
+            path = os.path.join(UPLOAD_DIR, filename)
+            with open(path, "wb") as buf:
+                shutil.copyfileobj(file.file, buf)
+            avatar_url = f"/uploads/{filename}"
+
+        await db.execute(
+            "UPDATE channels SET name = ?, description = ?, avatar_url = ? WHERE LOWER(channel_tag) = LOWER(?)",
+            (name.strip(), desc.strip(), avatar_url, clean_tag)
+        )
+        await db.commit()
+
+    return {"status": "ok", "name": name.strip(), "description": desc.strip(), "avatar_url": avatar_url}
+
+@app.post("/api/join_channel")
+async def join_channel(data: ChannelMemberModel):
+    clean_tag = data.channel_tag.strip().lstrip("#").lower()
+    uname = data.username.strip().lower()
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT members FROM channels WHERE LOWER(channel_tag) = LOWER(?)", (clean_tag,))
+        row = await cur.fetchone()
+        if not row:
+            return {"status": "error", "message": "Канал не найден"}
+        
+        members = json.loads(row[0] or "[]")
+        if uname not in members:
+            members.append(uname)
+            await db.execute("UPDATE channels SET members = ? WHERE LOWER(channel_tag) = LOWER(?)", (json.dumps(members), clean_tag))
+            await db.commit()
+    return {"status": "ok"}
+
+@app.post("/api/leave_channel")
+async def leave_channel(data: ChannelMemberModel):
+    clean_tag = data.channel_tag.strip().lstrip("#").lower()
+    uname = data.username.strip().lower()
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT members, creator_username FROM channels WHERE LOWER(channel_tag) = LOWER(?)", (clean_tag,))
+        row = await cur.fetchone()
+        if not row:
+            return {"status": "error", "message": "Канал не найден"}
+        
+        members = json.loads(row[0] or "[]")
+        if uname in members:
+            members.remove(uname)
+            await db.execute("UPDATE channels SET members = ? WHERE LOWER(channel_tag) = LOWER(?)", (json.dumps(members), clean_tag))
+            await db.commit()
+    return {"status": "ok"}
+
+@app.post("/api/add_channel_member")
+async def add_channel_member(data: ChannelMemberModel):
+    clean_tag = data.channel_tag.strip().lstrip("#").lower()
+    target_user = data.username.strip().lstrip("@").lower()
+    req_uname = data.requester.strip().lower()
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT creator_username, members FROM channels WHERE LOWER(channel_tag) = LOWER(?)", (clean_tag,))
+        row = await cur.fetchone()
+        if not row:
+            return {"status": "error", "message": "Канал не найден"}
+        if row[0].lower() != req_uname and not is_dev(req_uname):
+            return {"status": "error", "message": "Только владелец может добавлять участников"}
+
+        cur_u = await db.execute("SELECT id FROM users WHERE LOWER(username) = LOWER(?)", (target_user,))
+        if not await cur_u.fetchone():
+            return {"status": "error", "message": "Пользователь не найден"}
+
+        members = json.loads(row[1] or "[]")
+        if target_user not in members:
+            members.append(target_user)
+            await db.execute("UPDATE channels SET members = ? WHERE LOWER(channel_tag) = LOWER(?)", (json.dumps(members), clean_tag))
+            await db.commit()
+
+    return {"status": "ok", "message": f"@{target_user} добавлен в канал"}
 
 @app.get("/api/user_info")
 async def get_user_info(username: str, current_user: str):
@@ -434,15 +545,23 @@ async def get_user_chats(username: str):
         cur_blk = await db.execute("SELECT blocked FROM blocks WHERE LOWER(blocker) = LOWER(?)", (uname,))
         blocked_list = [r[0].lower() for r in await cur_blk.fetchall()]
 
-        cur_ch = await db.execute("SELECT channel_tag, name, avatar_url, pinned_msg_id, is_group, description, creator_username FROM channels")
+        # Каналы (показываем только те, где пользователь подписан или является создателем)
+        cur_ch = await db.execute("SELECT channel_tag, name, avatar_url, pinned_msg_id, description, creator_username, members FROM channels")
         for ch in await cur_ch.fetchall():
             tag_key = f"#{ch[0]}"
+            creator = ch[5]
+            members = [m.lower() for m in json.loads(ch[6] or "[]")]
+            
+            # Показываем в списке только если подписан
+            if uname not in members and creator.lower() != uname and not is_dev(uname):
+                continue
+
             cur_last = await db.execute(
                 "SELECT text, msg_type, timestamp FROM messages WHERE LOWER(target) = LOWER(?) AND is_deleted = 0 ORDER BY id DESC LIMIT 1",
                 (tag_key,)
             )
             last = await cur_last.fetchone()
-            last_text = "Группа создана" if ch[4] else "Канал создан"
+            last_text = "Канал создан"
             if last:
                 if last[1] == "voice": last_text = "🎙️ Голосовое"
                 elif last[1] == "image": last_text = "📷 Фотография"
@@ -453,17 +572,19 @@ async def get_user_chats(username: str):
                 "key": tag_key,
                 "name": ch[1],
                 "tag": tag_key,
-                "type": "group" if ch[4] else "channel",
+                "type": "channel",
                 "avatar": ch[2] or "",
                 "last_msg": last_text,
                 "time": last[2] if last else "",
                 "pinned_id": ch[3] or 0,
-                "desc": ch[5] or "",
-                "creator": ch[6],
+                "desc": ch[4] or "",
+                "creator": creator,
+                "is_member": True,
                 "is_dev": False,
                 "is_blocked": False
             })
 
+        # Приватные диалоги (только переписки текущего пользователя)
         cur_peers = await db.execute("""
             SELECT DISTINCT 
                 CASE WHEN LOWER(sender_username) = LOWER(?) THEN target ELSE sender_username END AS peer
@@ -553,22 +674,26 @@ async def search(q: str = "", current_user: str = "", offset: int = 0, limit: in
                     "is_dev": is_dev(uname)
                 })
 
-        cur_c = await db.execute("SELECT channel_tag, name, avatar_url, description, is_group FROM channels")
+        cur_c = await db.execute("SELECT channel_tag, name, avatar_url, description, creator_username, members FROM channels")
         for r in await cur_c.fetchall():
-            tag, name, avatar, desc, is_grp = r[0], r[1], r[2], r[3] or "", r[4]
+            tag, name, avatar, desc, creator, members_json = r[0], r[1], r[2], r[3] or "", r[4], r[5]
             s1 = calculate_score(clean_q, tag)
             s2 = calculate_score(clean_q, name)
             s3 = calculate_score(clean_q, desc) // 2
             final_score = max(s1, s2, s3)
             if final_score > 0:
+                members = [m.lower() for m in json.loads(members_json or "[]")]
+                is_sub = cur_uname in members or creator.lower() == cur_uname
                 results.append({
                     "score": final_score,
-                    "type": "group" if is_grp else "channel",
+                    "type": "channel",
                     "key": f"#{tag}",
                     "tag": f"#{tag}",
                     "name": name,
-                    "extra": desc or ("Группа" if is_grp else "Канал"),
+                    "extra": desc or "Канал",
                     "avatar": avatar or "",
+                    "creator": creator,
+                    "is_member": is_sub,
                     "is_dev": False
                 })
 
@@ -607,12 +732,48 @@ async def get_history(user: str, target: str):
     t_req = target.strip()
     async with aiosqlite.connect(DB_PATH) as db:
         if t_req.startswith("#"):
+            clean_tag = t_req.lstrip("#").lower()
+            cur_c = await db.execute("SELECT creator_username, members, description FROM channels WHERE LOWER(channel_tag) = LOWER(?)", (clean_tag,))
+            c_data = await cur_c.fetchone()
+            
+            creator = c_data[0] if c_data else ""
+            members = [m.lower() for m in json.loads(c_data[1] or "[]")] if c_data else []
+            desc = c_data[2] if c_data else ""
+            is_member = u_req in members or creator.lower() == u_req or is_dev(u_req)
+
             cur = await db.execute(
                 """SELECT id, sender_username, sender_name, target, text, msg_type, file_url, file_name, 
                           reply_to_id, reply_to_text, reply_to_sender, forward_from, reactions, is_read, is_edited, is_deleted, timestamp, avatar_url 
                    FROM messages WHERE LOWER(target) = LOWER(?) AND is_deleted = 0 ORDER BY id ASC LIMIT 250""",
                 (t_req,)
             )
+            rows = await cur.fetchall()
+            return {
+                "type": "channel",
+                "creator": creator,
+                "is_member": is_member,
+                "description": desc,
+                "messages": [{
+                    "id": r[0],
+                    "sender_username": r[1],
+                    "sender_name": r[2],
+                    "target": r[3],
+                    "text": r[4] or "",
+                    "msg_type": r[5] or "text",
+                    "file_url": r[6] or "",
+                    "file_name": r[7] or "",
+                    "reply_to_id": r[8] or 0,
+                    "reply_to_text": r[9] or "",
+                    "reply_to_sender": r[10] or "",
+                    "forward_from": r[11] or "",
+                    "reactions": json.loads(r[12] or "{}"),
+                    "is_read": bool(r[13]),
+                    "is_edited": bool(r[14]),
+                    "time": r[16],
+                    "avatar": r[17] or "",
+                    "is_dev": is_dev(r[1])
+                } for r in rows]
+            }
         else:
             t_uname = t_req.lower()
             await db.execute("UPDATE messages SET is_read = 1 WHERE LOWER(sender_username) = LOWER(?) AND LOWER(target) = LOWER(?)", (t_uname, u_req))
@@ -628,27 +789,30 @@ async def get_history(user: str, target: str):
                    ORDER BY id ASC LIMIT 250""",
                 (u_req, t_uname, t_uname, u_req)
             )
-        rows = await cur.fetchall()
-        return [{
-            "id": r[0],
-            "sender_username": r[1],
-            "sender_name": r[2],
-            "target": r[3],
-            "text": r[4] or "",
-            "msg_type": r[5] or "text",
-            "file_url": r[6] or "",
-            "file_name": r[7] or "",
-            "reply_to_id": r[8] or 0,
-            "reply_to_text": r[9] or "",
-            "reply_to_sender": r[10] or "",
-            "forward_from": r[11] or "",
-            "reactions": json.loads(r[12] or "{}"),
-            "is_read": bool(r[13]),
-            "is_edited": bool(r[14]),
-            "time": r[16],
-            "avatar": r[17] or "",
-            "is_dev": is_dev(r[1])
-        } for r in rows]
+            rows = await cur.fetchall()
+            return {
+                "type": "user",
+                "messages": [{
+                    "id": r[0],
+                    "sender_username": r[1],
+                    "sender_name": r[2],
+                    "target": r[3],
+                    "text": r[4] or "",
+                    "msg_type": r[5] or "text",
+                    "file_url": r[6] or "",
+                    "file_name": r[7] or "",
+                    "reply_to_id": r[8] or 0,
+                    "reply_to_text": r[9] or "",
+                    "reply_to_sender": r[10] or "",
+                    "forward_from": r[11] or "",
+                    "reactions": json.loads(r[12] or "{}"),
+                    "is_read": bool(r[13]),
+                    "is_edited": bool(r[14]),
+                    "time": r[16],
+                    "avatar": r[17] or "",
+                    "is_dev": is_dev(r[1])
+                } for r in rows]
+            }
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -1211,6 +1375,16 @@ HTML_TEMPLATE = """
             outline: none;
         }
 
+        .channel-restricted-bar {
+            padding: 14px 18px;
+            background: var(--bg-header);
+            border-top: 1px solid var(--border-color);
+            text-align: center;
+            color: var(--text-sub);
+            font-size: 0.9rem;
+            display: none;
+        }
+
         .bar-btn {
             background: transparent;
             border: none;
@@ -1239,19 +1413,17 @@ HTML_TEMPLATE = """
             justify-content: center;
         }
 
-        .load-more-btn {
-            background: var(--bg-sidebar-hover);
-            color: var(--badge-blue);
-            border: 1px solid var(--border-color);
-            padding: 10px;
-            border-radius: 10px;
-            margin: 12px 18px;
+        .header-sub-btn {
+            padding: 6px 12px;
+            border-radius: 8px;
+            font-size: 0.8rem;
             font-weight: 600;
-            font-size: 0.85rem;
+            border: none;
             cursor: pointer;
-            text-align: center;
+            transition: 0.2s;
         }
-        .load-more-btn:hover { opacity: 0.8; }
+        .btn-join { background: var(--badge-blue); color: #fff; }
+        .btn-leave { background: rgba(239, 68, 68, 0.15); color: #ef4444; border: 1px solid #ef4444; }
 
         .msg-menu {
             position: fixed;
@@ -1338,20 +1510,16 @@ HTML_TEMPLATE = """
 
 <div id="channel-modal" class="modal-overlay" style="display: none;">
     <div class="card-modal">
-        <h2>Создать канал или группу</h2>
-        <p class="subtitle">Публичное пространство или групповая беседа</p>
+        <h2>Создать канал</h2>
+        <p class="subtitle">Публичное пространство для публикаций и новостей</p>
         
-        <select id="chan-type-select">
-            <option value="0">📢 Канал (вещание)</option>
-            <option value="1">👥 Групповой чат (беседа)</option>
-        </select>
-        <input type="text" id="chan-name" placeholder="Название">
-        <input type="text" id="chan-tag" placeholder="Уникальный тег (например, dev, chat)">
-        <textarea id="chan-desc" rows="2" placeholder="Описание..."></textarea>
+        <input type="text" id="chan-name" placeholder="Название канала">
+        <input type="text" id="chan-tag" placeholder="Уникальный тег (например, dev, news)">
+        <textarea id="chan-desc" rows="2" placeholder="Описание канала..."></textarea>
         <label style="font-size: 0.8rem; color: var(--text-sub); display: block; margin-bottom: 6px;">Аватарка:</label>
         <input type="file" id="chan-file" accept="image/*">
 
-        <button class="btn-primary" onclick="createChannelSubmit()">Создать</button>
+        <button class="btn-primary" onclick="createChannelSubmit()">Создать канал</button>
         <button class="btn-cancel" onclick="document.getElementById('channel-modal').style.display='none'">Отмена</button>
     </div>
 </div>
@@ -1359,12 +1527,20 @@ HTML_TEMPLATE = """
 <div id="edit-channel-modal" class="modal-overlay" style="display: none;">
     <div class="card-modal">
         <h2>Настройки канала</h2>
-        <p class="subtitle">Изменение информации и аватарки</p>
+        <p class="subtitle">Изменение информации и управление участниками</p>
         
         <input type="text" id="edit-chan-name" placeholder="Название канала">
         <textarea id="edit-chan-desc" rows="2" placeholder="Описание канала..."></textarea>
         <label style="font-size: 0.8rem; color: var(--text-sub); display: block; margin-bottom: 6px;">Новая аватарка канала:</label>
         <input type="file" id="edit-chan-file" accept="image/*">
+
+        <div style="margin: 12px 0; border-top: 1px solid var(--border-color); padding-top: 12px;">
+            <label style="font-size: 0.8rem; color: var(--text-sub); display: block; margin-bottom: 6px;">Добавить участника (@юзернейм):</label>
+            <div style="display:flex; gap:6px;">
+                <input type="text" id="add-member-input" placeholder="@username" style="margin-bottom:0;">
+                <button class="btn-primary" style="width:auto; padding:0 14px; margin-top:0;" onclick="addMemberSubmit()">+</button>
+            </div>
+        </div>
 
         <button class="btn-primary" onclick="saveChannelEdit()">Сохранить изменения</button>
         <button class="btn-cancel" onclick="document.getElementById('edit-channel-modal').style.display='none'">Закрыть</button>
@@ -1382,6 +1558,11 @@ HTML_TEMPLATE = """
 
             <label style="font-size: 0.8rem; color: var(--text-sub); display: block; margin-bottom:4px;">Email почта:</label>
             <input type="email" id="profile-email-input" placeholder="Ваш email">
+
+            <div id="pwd-confirm-box" style="display:none;">
+                <label style="font-size: 0.8rem; color: #ef4444; display: block; margin-bottom:4px;">Введите текущий пароль для подтверждения смены Email:</label>
+                <input type="password" id="profile-pwd-input" placeholder="Ваш текущий пароль">
+            </div>
 
             <label style="font-size: 0.8rem; color: var(--text-sub); display: block; margin-bottom:4px;">Юзернейм:</label>
             <div style="display:flex; align-items:center; gap:8px; margin-bottom: 12px;">
@@ -1449,7 +1630,7 @@ HTML_TEMPLATE = """
             </div>
             <div class="sidebar-actions">
                 <button class="icon-btn" title="Сменить тему" onclick="toggleTheme()">🌓</button>
-                <button class="icon-btn" title="Создать канал или группу" onclick="document.getElementById('channel-modal').style.display='flex'">➕</button>
+                <button class="icon-btn" title="Создать канал" onclick="document.getElementById('channel-modal').style.display='flex'">➕</button>
             </div>
         </div>
 
@@ -1482,7 +1663,8 @@ HTML_TEMPLATE = """
                     </div>
                 </div>
 
-                <div style="display:flex; gap:8px;">
+                <div style="display:flex; align-items:center; gap:8px;">
+                    <button class="header-sub-btn" id="channel-action-btn" style="display:none;" onclick="toggleChannelSubscription()"></button>
                     <button class="icon-btn" id="channel-settings-btn" title="Настройки канала" style="display:none;" onclick="openChannelSettings()">⚙️</button>
                 </div>
             </div>
@@ -1502,13 +1684,17 @@ HTML_TEMPLATE = """
                 <span class="action-close" onclick="cancelAction()">✕</span>
             </div>
 
-            <div class="input-bar">
+            <div class="input-bar" id="chat-input-bar">
                 <button class="bar-btn" title="Прикрепить фото, видео или файл" onclick="document.getElementById('media-file-input').click()">📎</button>
                 <div class="input-wrapper">
                     <input type="text" id="msg-input" placeholder="Сообщение..." oninput="handleTyping()" onkeydown="if(event.key==='Enter') sendMsg()">
                 </div>
                 <button class="bar-btn" id="voice-btn" title="Голосовое сообщение" onclick="toggleVoiceRecord()">🎙️</button>
                 <button class="send-btn" onclick="sendMsg()">➤</button>
+            </div>
+
+            <div class="channel-restricted-bar" id="channel-restricted-bar">
+                📢 Только создатель канала может публиковать посты
             </div>
         </div>
     </div>
@@ -1517,6 +1703,7 @@ HTML_TEMPLATE = """
 <script>
     let user = JSON.parse(localStorage.getItem("messenger_user") || "null");
     let currentTarget = "";
+    let currentChannelData = null;
     let currentTheme = localStorage.getItem("messenger_theme") || "dark";
     let isRegister = false;
     let ws = null;
@@ -1773,9 +1960,16 @@ HTML_TEMPLATE = """
         const emailInput = document.getElementById("profile-email-input");
         const tagEl = document.getElementById("profile-tag");
         const statusSelect = document.getElementById("user-status-select");
+        const pwdBox = document.getElementById("pwd-confirm-box");
 
         if (nameInput) nameInput.value = user.display_name || "";
-        if (emailInput) emailInput.value = user.email || "";
+        if (emailInput) {
+            emailInput.value = user.email || "";
+            emailInput.oninput = () => {
+                pwdBox.style.display = (emailInput.value.trim().toLowerCase() !== (user.email || '').toLowerCase()) ? "block" : "none";
+            };
+        }
+        if (pwdBox) pwdBox.style.display = "none";
         if (tagEl) tagEl.innerText = "@" + user.username;
 
         renderAvatarEl(document.getElementById("profile-avatar-preview"), user.display_name, user.avatar_url);
@@ -1794,6 +1988,7 @@ HTML_TEMPLATE = """
     async function saveProfileChanges() {
         const newName = document.getElementById("profile-name-input").value.trim();
         const newEmail = document.getElementById("profile-email-input").value.trim().toLowerCase();
+        const pwd = document.getElementById("profile-pwd-input") ? document.getElementById("profile-pwd-input").value.trim() : "";
         const fileInput = document.getElementById("profile-file");
 
         if (!newName || !newEmail) {
@@ -1803,7 +1998,7 @@ HTML_TEMPLATE = """
         const res = await fetch("/api/update_profile", {
             method: "POST",
             headers: {"Content-Type": "application/json"},
-            body: JSON.stringify({ username: user.username, display_name: newName, email: newEmail })
+            body: JSON.stringify({ username: user.username, display_name: newName, email: newEmail, password: pwd })
         });
         const data = await res.json();
         if (data.status !== "ok") {
@@ -1880,10 +2075,46 @@ HTML_TEMPLATE = """
 
     function openChannelSettings() {
         const chat = chatsList.find(c => c.key.toLowerCase() === currentTarget.toLowerCase());
-        if (!chat) return;
-        document.getElementById("edit-chan-name").value = chat.name;
-        document.getElementById("edit-chan-desc").value = chat.desc || "";
+        const isOwner = (currentChannelData && currentChannelData.creator.toLowerCase() === user.username.toLowerCase()) || is_dev(user.username);
+        if (!isOwner) return;
+
+        document.getElementById("edit-chan-name").value = chat ? chat.name : "";
+        document.getElementById("edit-chan-desc").value = chat ? chat.desc : "";
         document.getElementById("edit-channel-modal").style.display = "flex";
+    }
+
+    async function addMemberSubmit() {
+        const input = document.getElementById("add-member-input");
+        const val = input.value.trim();
+        if (!val) return;
+
+        const res = await fetch("/api/add_channel_member", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({ channel_tag: currentTarget, username: val, requester: user.username })
+        });
+        const data = await res.json();
+        if (data.status === "ok") {
+            alert(data.message);
+            input.value = "";
+        } else {
+            alert(data.message);
+        }
+    }
+
+    async function toggleChannelSubscription() {
+        if (!currentTarget.startsWith("#") || !currentChannelData) return;
+        const endpoint = currentChannelData.is_member ? "/api/leave_channel" : "/api/join_channel";
+        const res = await fetch(endpoint, {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({ channel_tag: currentTarget, username: user.username })
+        });
+        const data = await res.json();
+        if (data.status === "ok") {
+            await fetchUserChats();
+            selectChat(currentTarget);
+        }
     }
 
     async function saveChannelEdit() {
@@ -1925,14 +2156,12 @@ HTML_TEMPLATE = """
     }
 
     async function createChannelSubmit() {
-        const isGroup = document.getElementById("chan-type-select").value;
         const name = document.getElementById("chan-name").value;
         const tag = document.getElementById("chan-tag").value;
         const desc = document.getElementById("chan-desc").value;
         const fileInput = document.getElementById("chan-file");
 
         const form = new FormData();
-        form.append("is_group", isGroup);
         form.append("name", name);
         form.append("tag", tag);
         form.append("desc", desc);
@@ -2002,26 +2231,12 @@ HTML_TEMPLATE = """
             const isUserDev = item.is_dev;
             
             div.onclick = () => {
-                const exists = chatsList.find(c => c.key.toLowerCase() === item.key.toLowerCase());
-                if (!exists && item.type !== 'message') {
-                    chatsList.unshift({
-                        key: item.key,
-                        name: item.name,
-                        tag: item.tag,
-                        type: item.type,
-                        avatar: item.avatar,
-                        last_msg: item.extra || "Новый диалог",
-                        time: "",
-                        is_dev: isUserDev,
-                        is_blocked: false
-                    });
-                }
                 selectChat(item.key);
                 document.getElementById("search-input").value = "";
             };
 
             const isMsg = item.type === "message";
-            const iconBadge = isMsg ? "💬 " : (item.type === "group" ? "👥 " : (item.type === "channel" ? "📢 " : ""));
+            const iconBadge = isMsg ? "💬 " : (item.type === "channel" ? "📢 " : "");
 
             div.innerHTML = `
                 <div class="avatar-wrap">
@@ -2053,7 +2268,7 @@ HTML_TEMPLATE = """
         list.innerHTML = "";
         
         if (chatsList.length === 0) {
-            list.innerHTML = `<div style="padding:30px 20px; text-align:center; color:var(--text-sub); font-size:0.85rem;">Нет чатов.<br>Создайте канал ➕ или найдите контакт через поиск 🔍</div>`;
+            list.innerHTML = `<div style="padding:30px 20px; text-align:center; color:var(--text-sub); font-size:0.85rem;">Нет активных чатов.<br>Создайте канал ➕ или найдите контакт через поиск 🔍</div>`;
             return;
         }
 
@@ -2087,7 +2302,7 @@ HTML_TEMPLATE = """
                         <div class="chat-time">${chat.time || ''}</div>
                     </div>
                     <div class="chat-bottom-row">
-                        <div class="chat-preview">${checkIcon}${chat.last_msg || (chat.type === 'group' ? 'Группа' : (chat.key.startsWith('#') ? 'Канал' : 'Диалог'))}</div>
+                        <div class="chat-preview">${checkIcon}${chat.last_msg || (chat.key.startsWith('#') ? 'Канал' : 'Диалог')}</div>
                     </div>
                 </div>
             `;
@@ -2100,7 +2315,7 @@ HTML_TEMPLATE = """
         if (!currentTarget) return;
         if (currentTarget.startsWith("#")) {
             const chat = chatsList.find(c => c.key.toLowerCase() === currentTarget.toLowerCase());
-            sub.innerText = chat ? (chat.type === 'group' ? 'Групповая беседа' : 'Канал') : 'Канал';
+            sub.innerText = (currentChannelData && currentChannelData.description) ? currentChannelData.description : (chat ? chat.desc || 'Канал' : 'Канал');
             return;
         }
         const isOnline = onlineUsers.includes(currentTarget.toLowerCase());
@@ -2131,10 +2346,8 @@ HTML_TEMPLATE = """
 
         document.getElementById("header-title").innerText = name;
         document.getElementById("header-dev-badge").style.display = isPeerDev ? "inline-flex" : "none";
-        document.getElementById("channel-settings-btn").style.display = key.startsWith("#") ? "flex" : "none";
         renderAvatarEl(document.getElementById("header-avatar"), name, avatar);
 
-        updateHeaderSubtitle();
         document.body.classList.add("in-chat");
         if (!document.getElementById("search-input").value.trim()) renderSidebar();
         
@@ -2148,7 +2361,41 @@ HTML_TEMPLATE = """
         if (!currentTarget) return;
         try {
             const res = await fetch(`/api/history?user=${encodeURIComponent(user.username)}&target=${encodeURIComponent(currentTarget)}`);
-            currentMessages = await res.json();
+            const data = await res.json();
+            
+            currentMessages = data.messages || [];
+            const isChannel = currentTarget.startsWith("#");
+
+            const inputBar = document.getElementById("chat-input-bar");
+            const restrictedBar = document.getElementById("channel-restricted-bar");
+            const subBtn = document.getElementById("channel-action-btn");
+            const settingsBtn = document.getElementById("channel-settings-btn");
+
+            if (isChannel) {
+                currentChannelData = data;
+                const isOwner = (data.creator.toLowerCase() === user.username.toLowerCase()) || is_dev(user.username);
+                
+                settingsBtn.style.display = isOwner ? "flex" : "none";
+                subBtn.style.display = isOwner ? "none" : "block";
+                subBtn.className = `header-sub-btn ${data.is_member ? 'btn-leave' : 'btn-join'}`;
+                subBtn.innerText = data.is_member ? "Покинуть" : "Подписаться";
+
+                if (isOwner) {
+                    inputBar.style.display = "flex";
+                    restrictedBar.style.display = "none";
+                } else {
+                    inputBar.style.display = "none";
+                    restrictedBar.style.display = "block";
+                }
+            } else {
+                currentChannelData = null;
+                settingsBtn.style.display = "none";
+                subBtn.style.display = "none";
+                inputBar.style.display = "flex";
+                restrictedBar.style.display = "none";
+            }
+
+            updateHeaderSubtitle();
             renderAllMessages();
         } catch(e) {}
     }
@@ -2567,6 +2814,15 @@ async def ws_endpoint(websocket: WebSocket, username: str):
             reply_sender = data.get("reply_to_sender", "")
             forward_from = data.get("forward_from", "")
             time_str = datetime.now().strftime("%H:%M")
+
+            # Если сообщение в канал — проверяем, что отправитель является создателем канала
+            if target.startswith("#"):
+                clean_tag = target.lstrip("#").lower()
+                async with aiosqlite.connect(DB_PATH) as db:
+                    cur_c = await db.execute("SELECT creator_username FROM channels WHERE LOWER(channel_tag) = LOWER(?)", (clean_tag,))
+                    c_row = await cur_c.fetchone()
+                    if not c_row or (c_row[0].lower() != uname and not is_dev(uname)):
+                        continue
 
             async with aiosqlite.connect(DB_PATH) as db:
                 cur = await db.execute(
