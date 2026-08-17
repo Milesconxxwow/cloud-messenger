@@ -205,6 +205,11 @@ class StatusModel(BaseModel):
     username: str
     status: str
 
+class UpdateProfileModel(BaseModel):
+    username: str
+    display_name: str
+    email: str
+
 @app.post("/api/register")
 async def register(data: RegisterModel):
     email = data.email.strip().lower()
@@ -273,6 +278,28 @@ async def login(data: LoginModel):
                 "is_dev": is_dev(user[0])
             }
         return {"status": "error", "message": "Неверный логин или пароль"}
+
+@app.post("/api/update_profile")
+async def update_profile(data: UpdateProfileModel):
+    uname = data.username.strip().lower()
+    new_name = data.display_name.strip()
+    new_email = data.email.strip().lower()
+
+    if not new_name or not new_email:
+        return {"status": "error", "message": "Имя и email не могут быть пустыми"}
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Проверяем, не занят ли email другим пользователем
+        cur_e = await db.execute("SELECT id FROM users WHERE LOWER(email) = LOWER(?) AND LOWER(username) != LOWER(?)", (new_email, uname))
+        if await cur_e.fetchone():
+            return {"status": "error", "message": "Этот Email уже занят другим аккаунтом"}
+
+        await db.execute("UPDATE users SET display_name = ?, email = ? WHERE LOWER(username) = LOWER(?)", (new_name, new_email, uname))
+        # Обновляем имя отправителя в сообщениях
+        await db.execute("UPDATE messages SET sender_name = ? WHERE LOWER(sender_username) = LOWER(?)", (new_name, uname))
+        await db.commit()
+
+        return {"status": "ok", "display_name": new_name, "email": new_email}
 
 @app.post("/api/upload_file")
 async def upload_file_endpoint(file: UploadFile = File(...)):
@@ -409,7 +436,6 @@ async def get_user_chats(username: str):
         cur_blk = await db.execute("SELECT blocked FROM blocks WHERE LOWER(blocker) = LOWER(?)", (uname,))
         blocked_list = [r[0].lower() for r in await cur_blk.fetchall()]
 
-        # Каналы и группы
         cur_ch = await db.execute("SELECT channel_tag, name, avatar_url, pinned_msg_id, is_group, description, creator_username FROM channels")
         for ch in await cur_ch.fetchall():
             tag_key = f"#{ch[0]}"
@@ -440,7 +466,6 @@ async def get_user_chats(username: str):
                 "is_blocked": False
             })
 
-        # Приватные диалоги (ТОЛЬКО там, где текущий пользователь является отправителем или получателем)
         cur_peers = await db.execute("""
             SELECT DISTINCT 
                 CASE WHEN LOWER(sender_username) = LOWER(?) THEN target ELSE sender_username END AS peer
@@ -549,7 +574,6 @@ async def search(q: str = "", current_user: str = "", offset: int = 0, limit: in
                     "is_dev": False
                 })
 
-        # Поиск сообщений строго в диалогах текущего пользователя
         if cur_uname:
             cur_m = await db.execute("""
                 SELECT id, sender_username, sender_name, target, text, timestamp 
@@ -593,11 +617,9 @@ async def get_history(user: str, target: str):
             )
         else:
             t_uname = t_req.lower()
-            # Отмечаем прочитанными только те сообщения, которые прислали НАМ
             await db.execute("UPDATE messages SET is_read = 1 WHERE LOWER(sender_username) = LOWER(?) AND LOWER(target) = LOWER(?)", (t_uname, u_req))
             await db.commit()
 
-            # Строгая изоляция: только сообщения между этими двумя пользователями
             cur = await db.execute(
                 """SELECT id, sender_username, sender_name, target, text, msg_type, file_url, file_name, 
                           reply_to_id, reply_to_text, reply_to_sender, forward_from, reactions, is_read, is_edited, is_deleted, timestamp, avatar_url 
@@ -1355,11 +1377,17 @@ HTML_TEMPLATE = """
     <div class="card-modal" style="text-align: center;">
         <h2>Мой профиль</h2>
         <div id="profile-avatar-preview" style="width: 80px; height: 80px; border-radius: 50%; margin: 15px auto; display:flex; align-items:center; justify-content:center; font-size:2rem; font-weight:bold; color:#fff; overflow:hidden;"></div>
-        <div style="display:flex; align-items:center; justify-content:center; gap:8px; margin-bottom:4px;">
-            <h3 id="profile-name" style="color:var(--text-main);"></h3>
-            <span id="profile-dev-badge" class="dev-badge" style="display:none;">🛠️ DEV</span>
+        
+        <div style="text-align: left; margin-bottom: 12px;">
+            <label style="font-size: 0.8rem; color: var(--text-sub); display: block; margin-bottom:4px;">Отображаемое имя (Ник):</label>
+            <input type="text" id="profile-name-input" placeholder="Ваш ник">
+
+            <label style="font-size: 0.8rem; color: var(--text-sub); display: block; margin-bottom:4px;">Email почта:</label>
+            <input type="email" id="profile-email-input" placeholder="Ваш email">
+
+            <label style="font-size: 0.8rem; color: var(--text-sub); display: block; margin-bottom:4px;">Юзернейм (логин):</label>
+            <p id="profile-tag" style="color: var(--badge-blue); font-size: 0.9rem; margin-bottom: 12px;"></p>
         </div>
-        <p id="profile-tag" style="color: var(--badge-blue); font-size: 0.9rem; margin-bottom: 12px;"></p>
         
         <label style="font-size: 0.8rem; color: var(--text-sub); display: block; text-align:left; margin-bottom:4px;">Личный статус:</label>
         <select id="user-status-select" onchange="changeMyStatus(this.value)">
@@ -1371,7 +1399,7 @@ HTML_TEMPLATE = """
         <label style="font-size: 0.8rem; color: var(--text-sub); display: block; text-align:left; margin-bottom:4px;">Сменить аватарку:</label>
         <input type="file" id="profile-file" accept="image/*">
         
-        <button class="btn-primary" onclick="uploadUserAvatar()">Сохранить аватарку</button>
+        <button class="btn-primary" onclick="saveProfileChanges()">Сохранить изменения профиля</button>
         <button class="btn-cancel" onclick="logout()" style="color: #ef4444; margin-top: 8px;">Выйти из Cipher 🚪</button>
         <button class="btn-cancel" onclick="document.getElementById('profile-modal').style.display='none'">Закрыть</button>
     </div>
@@ -1739,12 +1767,52 @@ HTML_TEMPLATE = """
     }
 
     function openProfile() {
-        document.getElementById("profile-name").innerText = user.display_name;
+        document.getElementById("profile-name-input").value = user.display_name;
+        document.getElementById("profile-email-input").value = user.email || "";
         document.getElementById("profile-tag").innerText = "@" + user.username;
         renderAvatarEl(document.getElementById("profile-avatar-preview"), user.display_name, user.avatar_url);
         if (checkIsDev(user.username)) document.getElementById("profile-dev-badge").style.display = "inline-flex";
         document.getElementById("user-status-select").value = user.custom_status || "online";
         document.getElementById("profile-modal").style.display = "flex";
+    }
+
+    async function saveProfileChanges() {
+        const newName = document.getElementById("profile-name-input").value.trim();
+        const newEmail = document.getElementById("profile-email-input").value.trim().lower();
+        const fileInput = document.getElementById("profile-file");
+
+        if (!newName || !newEmail) {
+            return alert("Заполните ник и email");
+        }
+
+        // Обновление ника и email
+        const res = await fetch("/api/update_profile", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({ username: user.username, display_name: newName, email: newEmail })
+        });
+        const data = await res.json();
+        if (data.status !== "ok") {
+            return alert(data.message);
+        }
+
+        user.display_name = newName;
+        user.email = newEmail;
+
+        // Если выбран новый файл аватарки
+        if (fileInput.files[0]) {
+            const form = new FormData();
+            form.append("username", user.username);
+            form.append("file", fileInput.files[0]);
+            const resAv = await fetch("/api/upload_avatar", { method: "POST", body: form });
+            const dataAv = await resAv.json();
+            if (dataAv.status === "ok") {
+                user.avatar_url = dataAv.avatar_url;
+            }
+        }
+
+        localStorage.setItem("messenger_user", JSON.stringify(user));
+        location.reload();
     }
 
     async function changeMyStatus(st) {
@@ -1840,23 +1908,6 @@ HTML_TEMPLATE = """
             btn.innerText = data.blocked ? "Разблокировать" : "🚫 Заблокировать";
             btn.style.background = data.blocked ? "#22c55e" : "#ef4444";
             fetchUserChats();
-        }
-    }
-
-    async function uploadUserAvatar() {
-        const fileInput = document.getElementById("profile-file");
-        if (!fileInput.files[0]) return alert("Выберите файл изображения");
-
-        const form = new FormData();
-        form.append("username", user.username);
-        form.append("file", fileInput.files[0]);
-
-        const res = await fetch("/api/upload_avatar", { method: "POST", body: form });
-        const data = await res.json();
-        if (data.status === "ok") {
-            user.avatar_url = data.avatar_url;
-            localStorage.setItem("messenger_user", JSON.stringify(user));
-            location.reload();
         }
     }
 
@@ -2442,7 +2493,7 @@ async def ws_endpoint(websocket: WebSocket, username: str):
                             reacts[emoji] = {"count": 1, "users": [uname]}
                         else:
                             if isinstance(reacts[emoji], int):
-                                reacts[emoji] = {"count": reacts[emoji] + 1, "users": [uname]}
+                                reacts[emoji] = {"count": reacts[emoji] + 1, "users": [username]}
                             else:
                                 if uname in reacts[emoji]["users"]:
                                     reacts[emoji]["users"].remove(uname)
