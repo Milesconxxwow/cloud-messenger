@@ -33,7 +33,6 @@ def hash_password(password: str) -> str:
 
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
-        # Таблица пользователей
         await db.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -45,7 +44,6 @@ async def init_db():
                 created_at TEXT NOT NULL
             )
         """)
-        # Таблица каналов
         await db.execute("""
             CREATE TABLE IF NOT EXISTS channels (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -57,7 +55,6 @@ async def init_db():
                 created_at TEXT NOT NULL
             )
         """)
-        # Таблица сообщений
         await db.execute("""
             CREATE TABLE IF NOT EXISTS messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -119,7 +116,7 @@ class RegisterModel(BaseModel):
     password: str
 
 class LoginModel(BaseModel):
-    login: str  # email или @username
+    login: str
     password: str
 
 @app.post("/api/register")
@@ -198,7 +195,7 @@ async def upload_avatar(username: str = Form(...), file: UploadFile = File(...))
 
 @app.post("/api/create_channel")
 async def create_channel(tag: str = Form(...), name: str = Form(...), desc: str = Form(""), creator: str = Form(...), file: UploadFile = File(None)):
-    clean_tag = tag.strip().lstrip("@").lower()
+    clean_tag = tag.strip().lstrip("#").lower()
     clean_name = name.strip()
     if not clean_tag or not clean_name:
         return {"status": "error", "message": "Укажите название и тег канала"}
@@ -226,23 +223,92 @@ async def create_channel(tag: str = Form(...), name: str = Form(...), desc: str 
 
     return {"status": "ok", "channel_tag": clean_tag, "name": clean_name, "avatar_url": avatar_url}
 
+@app.get("/api/chats")
+async def get_user_chats(username: str):
+    """Возвращает все сохраненные диалоги пользователя и каналы"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        chats = []
+        # Общий чат
+        cur_gen = await db.execute("SELECT text, timestamp FROM messages WHERE target = 'Общий чат' ORDER BY id DESC LIMIT 1")
+        last_gen = await cur_gen.fetchone()
+        chats.append({
+            "key": "Общий чат",
+            "name": "Общий чат",
+            "tag": "Общий чат",
+            "type": "channel",
+            "avatar": "",
+            "last_msg": last_gen[0] if last_gen else "Публичный канал связи",
+            "time": last_gen[1] if last_gen else ""
+        })
+
+        # Все каналы
+        cur_ch = await db.execute("SELECT channel_tag, name, avatar_url FROM channels")
+        for ch in await cur_ch.fetchall():
+            tag_key = f"#{ch[0]}"
+            cur_last = await db.execute("SELECT text, timestamp FROM messages WHERE target = ? ORDER BY id DESC LIMIT 1", (tag_key,))
+            last = await cur_last.fetchone()
+            chats.append({
+                "key": tag_key,
+                "name": ch[1],
+                "tag": tag_key,
+                "type": "channel",
+                "avatar": ch[2] or "",
+                "last_msg": last[0] if last else "Канал",
+                "time": last[1] if last else ""
+            })
+
+        # Все собеседники из сообщений
+        cur_peers = await db.execute("""
+            SELECT DISTINCT 
+                CASE WHEN sender_username = ? THEN target ELSE sender_username END AS peer
+            FROM messages 
+            WHERE (sender_username = ? OR target = ?) 
+              AND target != 'Общий чат' 
+              AND target NOT LIKE '#%'
+        """, (username, username, username))
+        
+        peers = [r[0] for r in await cur_peers.fetchall() if r[0] != username]
+
+        for p in peers:
+            cur_u = await db.execute("SELECT display_name, avatar_url FROM users WHERE username = ?", (p,))
+            u_data = await cur_u.fetchone()
+            name = u_data[0] if u_data else p
+            avatar = u_data[1] if u_data else ""
+            
+            cur_last = await db.execute("""
+                SELECT text, timestamp FROM messages 
+                WHERE (sender_username = ? AND target = ?) OR (sender_username = ? AND target = ?)
+                ORDER BY id DESC LIMIT 1
+            """, (username, p, p, username))
+            last = await cur_last.fetchone()
+
+            chats.append({
+                "key": p,
+                "name": name,
+                "tag": f"@{p}",
+                "type": "user",
+                "avatar": avatar,
+                "last_msg": last[0] if last else "",
+                "time": last[1] if last else ""
+            })
+
+        return {"chats": chats}
+
 @app.get("/api/search")
 async def search(q: str):
-    query = f"%{q.strip().lstrip('@').lower()}%"
+    query = f"%{q.strip().lstrip('@').lstrip('#').lower()}%"
     async with aiosqlite.connect(DB_PATH) as db:
-        # Поиск пользователей
         cur_u = await db.execute(
             "SELECT username, display_name, avatar_url FROM users WHERE username LIKE ? OR display_name LIKE ? LIMIT 10",
             (query, query)
         )
-        users = [{"type": "user", "tag": f"@{r[0]}", "name": r[1], "avatar": r[2]} for r in await cur_u.fetchall()]
+        users = [{"type": "user", "key": r[0], "tag": f"@{r[0]}", "name": r[1], "avatar": r[2]} for r in await cur_u.fetchall()]
 
-        # Поиск каналов
         cur_c = await db.execute(
             "SELECT channel_tag, name, avatar_url, description FROM channels WHERE channel_tag LIKE ? OR name LIKE ? LIMIT 10",
             (query, query)
         )
-        channels = [{"type": "channel", "tag": f"#{r[0]}", "name": r[1], "avatar": r[2], "desc": r[3]} for r in await cur_c.fetchall()]
+        channels = [{"type": "channel", "key": f"#{r[0]}", "tag": f"#{r[0]}", "name": r[1], "avatar": r[2], "desc": r[3]} for r in await cur_c.fetchall()]
 
         return {"results": users + channels}
 
@@ -313,11 +379,10 @@ HTML_TEMPLATE = """
             overflow: hidden;
         }
 
-        /* Модальные окна */
         .modal-overlay {
             position: fixed;
             inset: 0;
-            background: rgba(8, 10, 14, 0.92);
+            background: rgba(8, 10, 14, 0.94);
             backdrop-filter: blur(8px);
             display: flex;
             align-items: center;
@@ -372,14 +437,12 @@ HTML_TEMPLATE = """
             margin-top: 6px;
         }
 
-        /* Контейнер */
         #app-container {
             display: flex;
             height: 100%;
             width: 100%;
         }
 
-        /* Боковая панель */
         #sidebar {
             width: 380px;
             background: var(--bg-sidebar);
@@ -440,7 +503,6 @@ HTML_TEMPLATE = """
         }
         .icon-btn:hover { background: #262b3a; }
 
-        /* Поиск */
         .search-container {
             padding: 8px 16px 14px 16px;
             position: relative;
@@ -464,7 +526,6 @@ HTML_TEMPLATE = """
             color: var(--text-sub);
         }
 
-        /* Список чатов */
         .chat-list {
             flex: 1;
             overflow-y: auto;
@@ -546,7 +607,6 @@ HTML_TEMPLATE = """
             text-overflow: ellipsis;
         }
 
-        /* Область переписки */
         #chat-area {
             flex: 1;
             display: flex;
@@ -682,14 +742,13 @@ HTML_TEMPLATE = """
 </head>
 <body>
 
-<!-- Модалка Авторизации -->
 <div id="auth-modal" class="modal-overlay">
     <div class="card-modal">
         <h2 id="auth-title">Вход</h2>
         <p class="subtitle" id="auth-sub">Войдите в свой аккаунт</p>
         
         <input type="text" id="auth-login" placeholder="Email или @юзернейм">
-        <input type="text" id="auth-name" placeholder="Отображаемое имя (например, Дима)" style="display:none;">
+        <input type="text" id="auth-name" placeholder="Отображаемое имя" style="display:none;">
         <input type="text" id="auth-username" placeholder="Уникальный @юзернейм" style="display:none;">
         <input type="password" id="auth-pwd" placeholder="Пароль">
         
@@ -698,7 +757,6 @@ HTML_TEMPLATE = """
     </div>
 </div>
 
-<!-- Модалка Создания Канала -->
 <div id="channel-modal" class="modal-overlay" style="display: none;">
     <div class="card-modal">
         <h2>Создать канал</h2>
@@ -715,7 +773,6 @@ HTML_TEMPLATE = """
     </div>
 </div>
 
-<!-- Модалка Профиля / Смены Аватарки -->
 <div id="profile-modal" class="modal-overlay" style="display: none;">
     <div class="card-modal" style="text-align: center;">
         <h2>Мой профиль</h2>
@@ -778,11 +835,10 @@ HTML_TEMPLATE = """
 
 <script>
     let user = JSON.parse(localStorage.getItem("messenger_user") || "null");
+    let currentTarget = localStorage.getItem("messenger_target") || "Общий чат";
     let isRegister = false;
-    let currentTarget = "Общий чат";
     let ws = null;
-    let activeChats = ["Общий чат"];
-    let chatsMeta = { "Общий чат": { name: "Общий чат", tag: "Общий чат", avatar: "", type: "channel" } };
+    let chatsList = [];
     let onlineUsers = [];
 
     const gradients = [
@@ -810,7 +866,7 @@ HTML_TEMPLATE = """
     }
 
     window.onload = () => {
-        if (user) {
+        if (user && user.username) {
             document.getElementById("auth-modal").style.display = "none";
             startApp();
         }
@@ -863,7 +919,17 @@ HTML_TEMPLATE = """
 
     function logout() {
         localStorage.removeItem("messenger_user");
+        localStorage.removeItem("messenger_target");
         location.reload();
+    }
+
+    async function fetchUserChats() {
+        try {
+            const res = await fetch(`/api/chats?username=${encodeURIComponent(user.username)}`);
+            const data = await res.json();
+            chatsList = data.chats || [];
+            renderSidebar();
+        } catch(e) {}
     }
 
     function startApp() {
@@ -880,19 +946,19 @@ HTML_TEMPLATE = """
                 onlineUsers = data.users;
                 renderSidebar();
             } else if (data.type === "msg") {
-                const targetKey = data.target.startsWith("#") || data.target === "Общий чат" ? data.target : data.sender_username;
-                if (!activeChats.includes(targetKey)) {
-                    activeChats.push(targetKey);
-                    chatsMeta[targetKey] = { name: data.sender_name, tag: targetKey, avatar: data.avatar, type: "user" };
-                }
-                if (currentTarget === targetKey || (targetKey === data.sender_username && currentTarget === data.sender_username)) {
+                const isGroup = data.target === "Общий чат" || data.target.startsWith("#");
+                const chatKey = isGroup ? data.target : data.sender_username;
+                
+                if (currentTarget === chatKey || (isGroup && currentTarget === data.target)) {
                     appendMessage(data, false);
                 }
-                renderSidebar();
+                fetchUserChats();
             }
         };
 
-        selectChat("Общий чат");
+        fetchUserChats().then(() => {
+            selectChat(currentTarget);
+        });
     }
 
     function openProfile() {
@@ -936,10 +1002,8 @@ HTML_TEMPLATE = """
         const data = await res.json();
         if (data.status === "ok") {
             document.getElementById("channel-modal").style.display = "none";
-            const fullTag = "#" + data.channel_tag;
-            activeChats.unshift(fullTag);
-            chatsMeta[fullTag] = { name: data.name, tag: fullTag, avatar: data.avatar_url, type: "channel" };
-            selectChat(fullTag);
+            await fetchUserChats();
+            selectChat("#" + data.channel_tag);
         } else alert(data.message);
     }
 
@@ -964,12 +1028,19 @@ HTML_TEMPLATE = """
             const div = document.createElement("div");
             div.className = "chat-item";
             div.onclick = () => {
-                const targetKey = item.type === "user" ? item.tag.replace("@", "") : item.tag;
-                if (!activeChats.includes(targetKey)) {
-                    activeChats.unshift(targetKey);
-                    chatsMeta[targetKey] = { name: item.name, tag: item.tag, avatar: item.avatar, type: item.type };
+                const exists = chatsList.find(c => c.key === item.key);
+                if (!exists) {
+                    chatsList.unshift({
+                        key: item.key,
+                        name: item.name,
+                        tag: item.tag,
+                        type: item.type,
+                        avatar: item.avatar,
+                        last_msg: item.desc || "Новый диалог",
+                        time: ""
+                    });
                 }
-                selectChat(targetKey);
+                selectChat(item.key);
                 document.getElementById("search-input").value = "";
             };
             div.innerHTML = `
@@ -988,24 +1059,25 @@ HTML_TEMPLATE = """
     function renderSidebar() {
         const list = document.getElementById("chat-list");
         list.innerHTML = "";
-        activeChats.forEach(key => {
-            const meta = chatsMeta[key] || { name: key, tag: key, avatar: "" };
-            const isOnline = onlineUsers.includes(key);
-
+        chatsList.forEach(chat => {
+            const isOnline = onlineUsers.includes(chat.key);
             const div = document.createElement("div");
-            div.className = `chat-item ${currentTarget === key ? 'active' : ''}`;
-            div.onclick = () => selectChat(key);
+            div.className = `chat-item ${currentTarget === chat.key ? 'active' : ''}`;
+            div.onclick = () => selectChat(chat.key);
 
             div.innerHTML = `
                 <div class="avatar-wrap">
-                    <div class="avatar-img" style="background:${getGradient(meta.name)}">${meta.avatar ? `<img src="${meta.avatar}" style="width:100%;height:100%;border-radius:50%;object-fit:cover;">` : meta.name[0].toUpperCase()}</div>
+                    <div class="avatar-img" style="background:${getGradient(chat.name)}">${chat.avatar ? `<img src="${chat.avatar}" style="width:100%;height:100%;border-radius:50%;object-fit:cover;">` : chat.name[0].toUpperCase()}</div>
                     <div class="online-dot ${isOnline ? 'visible' : ''}"></div>
                 </div>
                 <div class="chat-details">
                     <div class="chat-top-row">
-                        <div class="chat-name">${meta.name}</div>
+                        <div class="chat-name">${chat.name}</div>
+                        <div class="chat-time">${chat.time || ''}</div>
                     </div>
-                    <div class="chat-preview">${key.startsWith('#') ? 'Канал' : (key === 'Общий чат' ? 'Публичный чат' : '@' + key)}</div>
+                    <div class="chat-bottom-row">
+                        <div class="chat-preview">${chat.last_msg || (chat.key.startsWith('#') ? 'Канал' : 'Диалог')}</div>
+                    </div>
                 </div>
             `;
             list.appendChild(div);
@@ -1014,11 +1086,16 @@ HTML_TEMPLATE = """
 
     async function selectChat(key) {
         currentTarget = key;
-        const meta = chatsMeta[key] || { name: key, tag: key, avatar: "" };
+        localStorage.setItem("messenger_target", key);
         
-        document.getElementById("header-title").innerText = meta.name;
-        document.getElementById("header-sub").innerText = key.startsWith("#") ? "Канал" : (key === "Общий чат" ? "Общая комната" : "@" + key);
-        renderAvatarEl(document.getElementById("header-avatar"), meta.name, meta.avatar);
+        let chat = chatsList.find(c => c.key === key);
+        const name = chat ? chat.name : key;
+        const tag = chat ? chat.tag : key;
+        const avatar = chat ? chat.avatar : "";
+
+        document.getElementById("header-title").innerText = name;
+        document.getElementById("header-sub").innerText = key.startsWith("#") ? "Канал" : (key === "Общий чат" ? "Общая комната" : tag);
+        renderAvatarEl(document.getElementById("header-avatar"), name, avatar);
 
         document.body.classList.add("in-chat");
         renderSidebar();
@@ -1066,6 +1143,7 @@ HTML_TEMPLATE = """
         appendMessage(payload, true);
         ws.send(JSON.stringify(payload));
         input.value = "";
+        fetchUserChats();
     }
 
     function escapeHtml(str) {
