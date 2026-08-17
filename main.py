@@ -7,13 +7,13 @@ import aiosqlite
 import re
 from datetime import datetime
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
 
-app = FastAPI(title="Cipher Messenger Pro with Permissions")
+app = FastAPI(title="Cipher Messenger v0.7(beta)")
 
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -957,7 +957,7 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Cipher Messenger</title>
+    <title>Cipher Messenger v0.7(beta)</title>
     <style>
         :root[data-theme="dark"] {
             --bg-main: #0b0d13;
@@ -1039,6 +1039,19 @@ HTML_TEMPLATE = """
             cursor: pointer;
         }
         a.mention:hover { text-decoration: underline; }
+
+        /* Взрывающиеся сердечки */
+        @keyframes heartBurst {
+            0% { transform: scale(0.5); opacity: 1; }
+            100% { transform: scale(2.5) translateY(-60px); opacity: 0; }
+        }
+        .floating-heart {
+            position: fixed;
+            font-size: 2rem;
+            animation: heartBurst 0.8s ease-out forwards;
+            pointer-events: none;
+            z-index: 9999;
+        }
 
         .modal-overlay {
             position: fixed;
@@ -1288,6 +1301,7 @@ HTML_TEMPLATE = """
             flex-direction: column;
             background: var(--bg-chat);
             height: 100%;
+            position: relative;
         }
 
         .empty-placeholder {
@@ -1493,6 +1507,7 @@ HTML_TEMPLATE = """
             display: flex;
             align-items: center;
             gap: 10px;
+            position: relative;
         }
         .input-wrapper {
             flex: 1;
@@ -1550,6 +1565,50 @@ HTML_TEMPLATE = """
             display: flex;
             align-items: center;
             justify-content: center;
+        }
+
+        /* Панель эмодзи */
+        .emoji-picker {
+            position: absolute;
+            bottom: 65px;
+            left: 18px;
+            background: var(--card-bg);
+            border: 1px solid var(--card-border);
+            border-radius: 14px;
+            padding: 10px;
+            display: none;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 8px;
+            box-shadow: 0 10px 25px rgba(0,0,0,0.5);
+            z-index: 100;
+        }
+        .emoji-picker span {
+            font-size: 1.5rem;
+            cursor: pointer;
+            text-align: center;
+            padding: 4px;
+            border-radius: 8px;
+        }
+        .emoji-picker span:hover { background: var(--bg-sidebar-hover); }
+
+        /* Кнопка "Вниз" */
+        .scroll-down-btn {
+            position: absolute;
+            bottom: 80px;
+            right: 25px;
+            background: var(--badge-blue);
+            color: white;
+            border: none;
+            border-radius: 20px;
+            padding: 8px 14px;
+            font-size: 0.8rem;
+            font-weight: 600;
+            cursor: pointer;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+            display: none;
+            align-items: center;
+            gap: 6px;
+            z-index: 50;
         }
 
         .header-sub-btn {
@@ -1623,6 +1682,7 @@ HTML_TEMPLATE = """
         <span onclick="sendReaction('🎉')">🎉</span>
         <span onclick="sendReaction('😢')">😢</span>
     </div>
+    <div class="msg-menu-item" onclick="copyMsgText()">📋 Копировать текст</div>
     <div class="msg-menu-item" onclick="startReply()">💬 Ответить</div>
     <div class="msg-menu-item" onclick="startForward()">↪️ Переслать</div>
     <div class="msg-menu-item" onclick="pinMessage()">📌 Закрепить</div>
@@ -1709,6 +1769,8 @@ HTML_TEMPLATE = """
                 <p id="profile-tag" style="color: var(--badge-blue); font-size: 0.95rem; font-weight: bold;"></p>
                 <span id="profile-dev-badge" class="dev-badge" style="display:none;">🛠️ DEV</span>
             </div>
+            
+            <p id="version-text" style="font-size: 0.78rem; color: var(--text-sub); text-align: center; margin-top: 10px;">Cipher 0.7(beta)</p>
         </div>
         
         <label style="font-size: 0.8rem; color: var(--text-sub); display: block; text-align:left; margin-bottom:4px;">Личный статус:</label>
@@ -1844,7 +1906,9 @@ HTML_TEMPLATE = """
                 <span style="color:var(--text-sub);" onclick="unpinMessage(event)">✕</span>
             </div>
 
-            <div class="messages-container" id="messages"></div>
+            <div class="messages-container" id="messages" onscroll="checkScrollPosition()"></div>
+
+            <button class="scroll-down-btn" id="scroll-down-btn" onclick="scrollToBottom()">⬇️ Вниз</button>
 
             <div id="action-banner" class="action-banner">
                 <div>
@@ -1855,6 +1919,22 @@ HTML_TEMPLATE = """
             </div>
 
             <div class="input-bar" id="chat-input-bar">
+                <!-- Панель эмодзи -->
+                <div class="emoji-picker" id="emoji-picker">
+                    <span onclick="insertEmoji('😂')">😂</span>
+                    <span onclick="insertEmoji('🔥')">🔥</span>
+                    <span onclick="insertEmoji('👍')">👍</span>
+                    <span onclick="insertEmoji('❤️')">❤️</span>
+                    <span onclick="insertEmoji('😮')">😮</span>
+                    <span onclick="insertEmoji('👏')">👏</span>
+                    <span onclick="insertEmoji('🎉')">🎉</span>
+                    <span onclick="insertEmoji('😢')">😢</span>
+                    <span onclick="insertEmoji('🚀')">🚀</span>
+                    <span onclick="insertEmoji('✨')">✨</span>
+                    <span onclick="insertEmoji('😎')">😎</span>
+                    <span onclick="insertEmoji('😭')">😭</span>
+                </div>
+                <button class="bar-btn" title="Выбрать эмодзи" onclick="toggleEmojiPicker(event)">😀</button>
                 <button class="bar-btn" title="Прикрепить фото, видео или файл" onclick="document.getElementById('media-file-input').click()">📎</button>
                 <div class="input-wrapper">
                     <input type="text" id="msg-input" placeholder="Сообщение..." oninput="handleTyping()" onkeydown="if(event.key==='Enter') sendMsg()">
@@ -1896,6 +1976,7 @@ HTML_TEMPLATE = """
     let audioChunks = [];
     let isRecording = false;
     let typingTimeout = null;
+    let isUserScrolledUp = false;
 
     document.documentElement.setAttribute("data-theme", currentTheme);
 
@@ -1905,6 +1986,7 @@ HTML_TEMPLATE = """
         localStorage.setItem("messenger_theme", currentTheme);
     }
 
+    // Звук нового сообщения
     function playNotificationSound() {
         try {
             const ctx = new (window.AudioContext || window.webkitAudioContext)();
@@ -1922,16 +2004,34 @@ HTML_TEMPLATE = """
         } catch(e) {}
     }
 
-    // Запрос разрешений на микрофон и уведомления при старте приложения
+    // Звук при отправке сообщения
+    function playSendSound() {
+        try {
+            const ctx = new (window.AudioContext || window.webkitAudioContext)();
+            const osc = ctx.createOscillator();
+            const gain = ctx.createGain();
+            osc.type = "triangle";
+            osc.frequency.setValueAtTime(440, ctx.currentTime);
+            osc.frequency.exponentialRampToValueAtTime(660, ctx.currentTime + 0.08);
+            gain.gain.setValueAtTime(0.15, ctx.currentTime);
+            gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.12);
+            osc.connect(gain);
+            gain.connect(ctx.destination);
+            osc.start();
+            osc.stop(ctx.currentTime + 0.12);
+        } catch(e) {}
+    }
+
+    // Запрос разрешений при старте (микрофон и уведомления)
     async function requestPermissionsOnStart() {
         if ("Notification" in window && Notification.permission !== "granted" && Notification.permission !== "denied") {
             await Notification.requestPermission();
         }
     }
 
-    function showBrowserNotification(title, text) {
+    function showBrowserNotification(title, text, avatarUrl) {
         if ("Notification" in window && Notification.permission === "granted" && document.hidden) {
-            new Notification(title, { body: text, icon: "/icon.svg" });
+            new Notification(title, { body: text, icon: avatarUrl || "/icon.svg" });
         }
     }
 
@@ -1989,10 +2089,64 @@ HTML_TEMPLATE = """
             document.getElementById("auth-modal").style.display = "none";
             startApp();
         }
-        document.addEventListener("click", () => {
+        document.addEventListener("click", (e) => {
             document.getElementById("msg-menu").style.display = "none";
+            const picker = document.getElementById("emoji-picker");
+            if (picker && !picker.contains(e.target) && !e.target.title?.includes("эмодзи")) {
+                picker.style.display = "none";
+            }
         });
     };
+
+    function toggleEmojiPicker(e) {
+        e.stopPropagation();
+        const picker = document.getElementById("emoji-picker");
+        picker.style.display = picker.style.display === "grid" ? "none" : "grid";
+    }
+
+    function insertEmoji(emo) {
+        const input = document.getElementById("msg-input");
+        input.value += emo;
+        input.focus();
+        document.getElementById("emoji-picker").style.display = "none";
+    }
+
+    // Анимация взрывающихся сердец
+    function triggerHeartAnimation() {
+        for (let i = 0; i < 7; i++) {
+            const heart = document.createElement("div");
+            heart.className = "floating-heart";
+            heart.innerHTML = "❤️";
+            heart.style.left = `${window.innerWidth / 2 + (Math.random() * 100 - 50)}px`;
+            heart.style.top = `${window.innerHeight - 150}px`;
+            document.body.appendChild(heart);
+            setTimeout(() => heart.remove(), 800);
+        }
+    }
+
+    function checkScrollPosition() {
+        const box = document.getElementById("messages");
+        const scrollBtn = document.getElementById("scroll-down-btn");
+        if (!box) return;
+        const isUp = box.scrollHeight - box.scrollTop - box.clientHeight > 150;
+        isUserScrolledUp = isUp;
+        scrollBtn.style.display = isUp ? "flex" : "none";
+    }
+
+    function scrollToBottom() {
+        const box = document.getElementById("messages");
+        if (box) {
+            box.scrollTop = box.scrollHeight;
+            isUserScrolledUp = false;
+            document.getElementById("scroll-down-btn").style.display = "none";
+        }
+    }
+
+    function copyMsgText() {
+        if (!selectedMsg || !selectedMsg.text) return;
+        navigator.clipboard.writeText(selectedMsg.text);
+        document.getElementById("msg-menu").style.display = "none";
+    }
 
     function toggleAuth() {
         isRegister = !isRegister;
@@ -2109,7 +2263,7 @@ HTML_TEMPLATE = """
 
                 if (!isMine) {
                     playNotificationSound();
-                    showBrowserNotification(data.sender_name, data.text || "Медиафайл");
+                    showBrowserNotification(data.sender_name, data.text || "Медиафайл", data.avatar);
                 }
 
                 if (isGroup ? targetMatch : (senderMatch || (isMine && targetMatch))) {
@@ -2717,7 +2871,7 @@ HTML_TEMPLATE = """
                     inputBar.style.display = "flex";
                     restrictedBar.style.display = "none";
                 } else {
-                    inputBar.style.display = data.is_member ? "none" : "none";
+                    inputBar.style.display = "none";
                     restrictedBar.style.display = data.is_member ? "block" : "none";
                     if (!data.is_member) restrictedBar.innerText = "📢 Вы не подписаны на этот канал";
                     else restrictedBar.innerText = "📢 Только создатель канала может публиковать посты";
@@ -2732,6 +2886,10 @@ HTML_TEMPLATE = """
 
             updateHeaderSubtitle();
             renderAllMessages();
+            if (!isUserScrolledUp) {
+                const box = document.getElementById("messages");
+                box.scrollTop = box.scrollHeight;
+            }
         } catch(e) {}
     }
 
@@ -2802,7 +2960,6 @@ HTML_TEMPLATE = """
             `;
             box.appendChild(row);
         });
-        box.scrollTop = box.scrollHeight;
     }
 
     function openMsgMenu(e, id, isMine) {
@@ -2948,6 +3105,7 @@ HTML_TEMPLATE = """
         const res = await fetch("/api/upload_file", { method: "POST", body: form });
         const data = await res.json();
         if (data.status === "ok") {
+            playSendSound();
             const timeStr = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
             const payload = {
                 action: "send",
@@ -2972,7 +3130,6 @@ HTML_TEMPLATE = """
         document.getElementById("media-file-input").value = "";
     }
 
-    // Функция явного запроса разрешения на микрофон перед записью
     async function requestMicAndToggleRecord() {
         const btn = document.getElementById("voice-btn");
         if (!isRecording) {
@@ -2994,7 +3151,7 @@ HTML_TEMPLATE = """
                 btn.classList.add("recording");
                 btn.title = "Нажмите для отправки";
             } catch (err) {
-                alert("Для записи голосовых сообщений необходимо разрешить доступ к микрофону в браузере.");
+                alert("Для записи голосовых сообщений необходимо разрешить доступ к микрофону.");
             }
         } else {
             mediaRecorder.stop();
@@ -3018,6 +3175,11 @@ HTML_TEMPLATE = """
             }));
             cancelAction();
             return;
+        }
+
+        playSendSound();
+        if (text.includes("❤️") || text.toLowerCase().includes("сердце")) {
+            triggerHeartAnimation();
         }
 
         const timeStr = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
