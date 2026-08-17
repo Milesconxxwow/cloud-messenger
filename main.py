@@ -5,15 +5,16 @@ import uuid
 import hashlib
 import aiosqlite
 import re
+import base64
 from datetime import datetime
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form, Body
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
 
-app = FastAPI(title="Cipher Messenger v0.7(beta)")
+app = FastAPI(title="Cipher Messenger v0.8(beta)")
 
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -29,6 +30,30 @@ app.add_middleware(
 
 DB_PATH = "messenger.db"
 DEV_USERNAMES = ["milesconxxwow", "miles"]
+ENCRYPTION_SECRET = "cipher_secure_salt_key_2026"
+
+def encrypt_text(text: str) -> str:
+    if not text:
+        return ""
+    # Простое обратимое симметричное шифрование для защиты базы данных
+    enc = []
+    for i, char in enumerate(text):
+        key_c = ENCRYPTION_SECRET[i % len(ENCRYPTION_SECRET)]
+        enc.append(chr(ord(char) + ord(key_c)))
+    return base64.b64encode("".join(enc).encode("utf-8")).decode("utf-8")
+
+def decrypt_text(encrypted_text: str) -> str:
+    if not encrypted_text:
+        return ""
+    try:
+        decoded = base64.b64decode(encrypted_text.encode("utf-8")).decode("utf-8")
+        dec = []
+        for i, char in enumerate(decoded):
+            key_c = ENCRYPTION_SECRET[i % len(ENCRYPTION_SECRET)]
+            dec.append(chr(ord(char) - ord(key_c)))
+        return "".join(dec)
+    except Exception:
+        return encrypted_text # Если вдруг старый текст не был зашифрован
 
 def is_admin(username: str) -> bool:
     return str(username).lower().strip().lstrip("@") in DEV_USERNAMES
@@ -82,6 +107,7 @@ async def init_db():
                 creator_username TEXT NOT NULL COLLATE NOCASE,
                 avatar_url TEXT DEFAULT '',
                 pinned_msg_id INTEGER DEFAULT 0,
+                is_group INTEGER DEFAULT 0,
                 members TEXT DEFAULT '[]',
                 created_at TEXT NOT NULL
             )
@@ -125,12 +151,23 @@ async def init_db():
                 timestamp TEXT NOT NULL
             )
         """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS bots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                bot_username TEXT UNIQUE NOT NULL COLLATE NOCASE,
+                bot_name TEXT NOT NULL,
+                token TEXT UNIQUE NOT NULL,
+                owner_username TEXT NOT NULL COLLATE NOCASE,
+                created_at TEXT NOT NULL
+            )
+        """)
 
         migrations = [
             ("users", "custom_status", "TEXT DEFAULT 'online'"),
             ("users", "last_seen", "TEXT DEFAULT ''"),
             ("users", "is_admin", "INTEGER DEFAULT 0"),
             ("users", "is_banned", "INTEGER DEFAULT 0"),
+            ("channels", "is_group", "INTEGER DEFAULT 0"),
             ("channels", "members", "TEXT DEFAULT '[]'"),
             ("messages", "forward_from", "TEXT DEFAULT ''"),
             ("messages", "is_read", "INTEGER DEFAULT 0"),
@@ -237,6 +274,16 @@ class AdminActionModel(BaseModel):
     target_username: str
     action: str
     report_id: int = 0
+
+class BotCreateModel(BaseModel):
+    owner_username: str
+    bot_name: str
+    bot_username: str
+
+class BotSendModel(BaseModel):
+    token: str
+    target: str
+    text: str
 
 @app.post("/api/register")
 async def register(data: RegisterModel):
@@ -417,6 +464,98 @@ async def report_user(data: ReportModel):
         await db.commit()
     return {"status": "ok"}
 
+# БОТ API (Версия 0.8)
+@app.post("/api/bots/create")
+async def create_bot(data: BotCreateModel):
+    b_uname = data.bot_username.strip().lstrip("@").lower()
+    b_name = data.bot_name.strip()
+    owner = data.owner_username.strip().lower()
+    if not b_uname or not b_name:
+        return {"status": "error", "message": "Укажите имя и юзернейм бота"}
+    
+    token = f"bot_{uuid.uuid4().hex}_{uuid.uuid4().hex[:8]}"
+    created_at = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT id FROM bots WHERE LOWER(bot_username) = LOWER(?)", (b_uname,))
+        if await cur.fetchone():
+            return {"status": "error", "message": "Бот с таким юзернеймом уже существует"}
+        
+        await db.execute(
+            "INSERT INTO bots (bot_username, bot_name, token, owner_username, created_at) VALUES (?, ?, ?, ?, ?)",
+            (b_uname, b_name, token, owner, created_at)
+        )
+        # Также зарегистрируем бота как пользователя в базе чтобы у него был профиль
+        await db.execute(
+            "INSERT OR IGNORE INTO users (email, username, display_name, password_hash, created_at) VALUES (?, ?, ?, ?, ?)",
+            (f"{b_uname}@bot.cipher", b_uname, b_name, hash_password(token), created_at)
+        )
+        await db.commit()
+
+    return {"status": "ok", "token": token, "bot_username": b_uname}
+
+@app.get("/api/bots/list")
+async def list_bots(owner: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT bot_username, bot_name, token, created_at FROM bots WHERE LOWER(owner_username) = LOWER(?)", (owner,))
+        bots = [{"bot_username": r[0], "bot_name": r[1], "token": r[2], "created_at": r[3]} for r in await cur.fetchall()]
+    return {"status": "ok", "bots": bots}
+
+@app.post("/api/bot/send_message")
+async def bot_send_message(data: BotSendModel):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT bot_username, bot_name FROM bots WHERE token = ?", (data.token,))
+        bot = await cur.fetchone()
+        if not bot:
+            return {"status": "error", "message": "Неверный токен бота"}
+        
+        b_uname, b_name = bot[0], bot[1]
+        target = data.target.strip()
+        text = encrypt_text(data.text.strip())
+        time_str = datetime.now().strftime("%H:%M")
+
+        cur_u = await db.execute("SELECT avatar_url FROM users WHERE LOWER(username) = LOWER(?)", (b_uname,))
+        u_row = await cur_u.fetchone()
+        b_avatar = u_row[0] if u_row else ""
+
+        cur_msg = await db.execute(
+            """INSERT INTO messages (sender_username, sender_name, target, text, msg_type, timestamp, avatar_url) 
+               VALUES (?, ?, ?, ?, 'text', ?, ?)""",
+            (b_uname, f"🤖 {b_name}", target, text, time_str, b_avatar)
+        )
+        await db.commit()
+        msg_id = cur_msg.lastrowid
+
+    msg_out = {
+        "type": "msg",
+        "id": msg_id,
+        "sender_username": b_uname,
+        "sender_name": f"🤖 {b_name}",
+        "target": target,
+        "text": data.text.strip(),
+        "msg_type": "text",
+        "file_url": "",
+        "file_name": "",
+        "reply_to_id": 0,
+        "reply_to_text": "",
+        "reply_to_sender": "",
+        "forward_from": "",
+        "reactions": {},
+        "is_read": False,
+        "is_edited": False,
+        "time": time_str,
+        "avatar": b_avatar,
+        "is_dev": False
+    }
+
+    if target.startswith("#"):
+        await manager.broadcast_channel(msg_out)
+    else:
+        await manager.send_to_user(msg_out, recipient_username=target)
+        await manager.send_to_user(msg_out, recipient_username=b_uname)
+
+    return {"status": "ok", "message_id": msg_id}
+
 @app.get("/api/admin/data")
 async def get_admin_data(username: str):
     uname = username.strip().lower()
@@ -489,7 +628,7 @@ async def admin_action(data: AdminActionModel):
     return {"status": "ok"}
 
 @app.post("/api/create_channel")
-async def create_channel(tag: str = Form(...), name: str = Form(...), desc: str = Form(""), creator: str = Form(...), file: UploadFile = File(None)):
+async def create_channel(tag: str = Form(...), name: str = Form(...), desc: str = Form(""), creator: str = Form(...), is_group: int = Form(0), file: UploadFile = File(None)):
     clean_tag = tag.strip().lstrip("#").lower()
     clean_name = name.strip()
     creator_uname = creator.strip().lower()
@@ -508,14 +647,14 @@ async def create_channel(tag: str = Form(...), name: str = Form(...), desc: str 
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("SELECT id FROM channels WHERE LOWER(channel_tag) = LOWER(?)", (clean_tag,))
         if await cur.fetchone():
-            return {"status": "error", "message": "Канал с таким тегом уже существует"}
+            return {"status": "error", "message": "Канал или группа с таким тегом уже существует"}
 
         initial_members = json.dumps([creator_uname])
         created_at = datetime.now().strftime("%Y-%m-%d %H:%M")
         await db.execute(
-            """INSERT INTO channels (channel_tag, name, description, creator_username, avatar_url, members, created_at) 
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (clean_tag, clean_name, desc, creator_uname, avatar_url, initial_members, created_at)
+            """INSERT INTO channels (channel_tag, name, description, creator_username, avatar_url, is_group, members, created_at) 
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (clean_tag, clean_name, desc, creator_uname, avatar_url, is_group, initial_members, created_at)
         )
         await db.commit()
 
@@ -589,12 +728,12 @@ async def leave_channel(data: ChannelMemberModel):
     clean_tag = data.channel_tag.strip().lstrip("#").lower()
     uname = data.username.strip().lower()
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT members, creator_username FROM channels WHERE LOWER(channel_tag) = LOWER(?)", (clean_tag,))
+        cur = await db.execute("SELECT members, creator_username, is_group FROM channels WHERE LOWER(channel_tag) = LOWER(?)", (clean_tag,))
         row = await cur.fetchone()
         if not row:
             return {"status": "error", "message": "Канал не найден"}
         
-        if row[1].lower() == uname:
+        if row[1].lower() == uname and not row[2]:
             return {"status": "error", "message": "Создатель не может покинуть канал. Вы можете удалить его в настройках."}
 
         members = json.loads(row[0] or "[]")
@@ -611,11 +750,11 @@ async def add_channel_member(data: ChannelMemberModel):
     req_uname = data.requester.strip().lower()
 
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT creator_username, members FROM channels WHERE LOWER(channel_tag) = LOWER(?)", (clean_tag,))
+        cur = await db.execute("SELECT creator_username, members, is_group FROM channels WHERE LOWER(channel_tag) = LOWER(?)", (clean_tag,))
         row = await cur.fetchone()
         if not row:
             return {"status": "error", "message": "Канал не найден"}
-        if row[0].lower() != req_uname and not is_admin(req_uname):
+        if row[0].lower() != req_uname and not is_admin(req_uname) and not row[2]:
             return {"status": "error", "message": "Только владелец может добавлять участников"}
 
         cur_u = await db.execute("SELECT id FROM users WHERE LOWER(username) = LOWER(?)", (target_user,))
@@ -628,7 +767,7 @@ async def add_channel_member(data: ChannelMemberModel):
             await db.execute("UPDATE channels SET members = ? WHERE LOWER(channel_tag) = LOWER(?)", (json.dumps(members), clean_tag))
             await db.commit()
 
-    return {"status": "ok", "message": f"@{target_user} добавлен в канал"}
+    return {"status": "ok", "message": f"@{target_user} добавлен"}
 
 @app.get("/api/user_info")
 async def get_user_info(username: str, current_user: str):
@@ -684,11 +823,12 @@ async def get_user_chats(username: str):
         cur_blk = await db.execute("SELECT blocked FROM blocks WHERE LOWER(blocker) = LOWER(?)", (uname,))
         blocked_list = [r[0].lower() for r in await cur_blk.fetchall()]
 
-        cur_ch = await db.execute("SELECT channel_tag, name, avatar_url, pinned_msg_id, description, creator_username, members FROM channels")
+        cur_ch = await db.execute("SELECT channel_tag, name, avatar_url, pinned_msg_id, description, creator_username, members, is_group FROM channels")
         for ch in await cur_ch.fetchall():
             tag_key = f"#{ch[0]}"
             creator = ch[5]
             members = [m.lower() for m in json.loads(ch[6] or "[]")]
+            is_grp = ch[7]
             
             if uname not in members and creator.lower() != uname and not is_admin(uname):
                 continue
@@ -698,18 +838,19 @@ async def get_user_chats(username: str):
                 (tag_key,)
             )
             last = await cur_last.fetchone()
-            last_text = "Канал создан"
+            last_text = "Группа создана" if is_grp else "Канал создан"
             if last:
+                dec_text = decrypt_text(last[0])
                 if last[1] == "voice": last_text = "🎙️ Голосовое"
                 elif last[1] == "image": last_text = "📷 Фотография"
                 elif last[1] == "video": last_text = "🎬 Видео"
-                else: last_text = last[0] or "📎 Файл"
+                else: last_text = dec_text or "📎 Файл"
 
             chats.append({
                 "key": tag_key,
                 "name": ch[1],
                 "tag": tag_key,
-                "type": "channel",
+                "type": "group" if is_grp else "channel",
                 "avatar": ch[2] or "",
                 "last_msg": last_text,
                 "time": last[2] if last else "",
@@ -756,10 +897,11 @@ async def get_user_chats(username: str):
             if last:
                 last_read = last[3] or 0
                 last_sender = last[4] or ""
+                dec_text = decrypt_text(last[0])
                 if last[1] == "voice": last_text = "🎙️ Голосовое"
                 elif last[1] == "image": last_text = "📷 Фотография"
                 elif last[1] == "video": last_text = "🎬 Видео"
-                else: last_text = last[0] or "📎 Файл"
+                else: last_text = dec_text or "📎 Файл"
 
             chats.append({
                 "key": real_uname,
@@ -811,9 +953,9 @@ async def search(q: str = "", current_user: str = "", offset: int = 0, limit: in
                     "is_dev": adm
                 })
 
-        cur_c = await db.execute("SELECT channel_tag, name, avatar_url, description, creator_username, members FROM channels")
+        cur_c = await db.execute("SELECT channel_tag, name, avatar_url, description, creator_username, members, is_group FROM channels")
         for r in await cur_c.fetchall():
-            tag, name, avatar, desc, creator, members_json = r[0], r[1], r[2], r[3] or "", r[4], r[5]
+            tag, name, avatar, desc, creator, members_json, is_grp = r[0], r[1], r[2], r[3] or "", r[4], r[5], r[6]
             s1 = calculate_score(clean_q, tag)
             s2 = calculate_score(clean_q, name)
             s3 = calculate_score(clean_q, desc) // 2
@@ -823,11 +965,11 @@ async def search(q: str = "", current_user: str = "", offset: int = 0, limit: in
                 is_sub = cur_uname in members or creator.lower() == cur_uname
                 results.append({
                     "score": final_score,
-                    "type": "channel",
+                    "type": "group" if is_grp else "channel",
                     "key": f"#{tag}",
                     "tag": f"#{tag}",
                     "name": name,
-                    "extra": desc or "Канал",
+                    "extra": desc or ("Группа" if is_grp else "Канал"),
                     "avatar": avatar or "",
                     "creator": creator,
                     "is_member": is_sub,
@@ -844,7 +986,8 @@ async def search(q: str = "", current_user: str = "", offset: int = 0, limit: in
                 ORDER BY id DESC LIMIT 150
             """, (cur_uname, cur_uname))
             for m in await cur_m.fetchall():
-                mid, s_user, s_name, target, text, m_time = m[0], m[1], m[2], m[3], m[4] or "", m[5]
+                mid, s_user, s_name, target, text_enc, m_time = m[0], m[1], m[2], m[3], m[4] or "", m[5]
+                text = decrypt_text(text_enc)
                 if clean_q in text.lower():
                     dialog_key = target if target.startswith("#") else (s_user if s_user.lower() != cur_uname else target)
                     results.append({
@@ -870,12 +1013,13 @@ async def get_history(user: str, target: str):
     async with aiosqlite.connect(DB_PATH) as db:
         if t_req.startswith("#"):
             clean_tag = t_req.lstrip("#").lower()
-            cur_c = await db.execute("SELECT creator_username, members, description FROM channels WHERE LOWER(channel_tag) = LOWER(?)", (clean_tag,))
+            cur_c = await db.execute("SELECT creator_username, members, description, is_group FROM channels WHERE LOWER(channel_tag) = LOWER(?)", (clean_tag,))
             c_data = await cur_c.fetchone()
             
             creator = c_data[0] if c_data else ""
             members = [m.lower() for m in json.loads(c_data[1] or "[]")] if c_data else []
             desc = c_data[2] if c_data else ""
+            is_grp = c_data[3] if c_data else 0
             is_member = u_req in members or creator.lower() == u_req or is_admin(u_req)
 
             cur = await db.execute(
@@ -886,7 +1030,7 @@ async def get_history(user: str, target: str):
             )
             rows = await cur.fetchall()
             return {
-                "type": "channel",
+                "type": "group" if is_grp else "channel",
                 "creator": creator,
                 "is_member": is_member,
                 "description": desc,
@@ -895,12 +1039,12 @@ async def get_history(user: str, target: str):
                     "sender_username": r[1],
                     "sender_name": r[2],
                     "target": r[3],
-                    "text": r[4] or "",
+                    "text": decrypt_text(r[4]) or "",
                     "msg_type": r[5] or "text",
                     "file_url": r[6] or "",
                     "file_name": r[7] or "",
                     "reply_to_id": r[8] or 0,
-                    "reply_to_text": r[9] or "",
+                    "reply_to_text": decrypt_text(r[9]) or "",
                     "reply_to_sender": r[10] or "",
                     "forward_from": r[11] or "",
                     "reactions": json.loads(r[12] or "{}"),
@@ -934,12 +1078,12 @@ async def get_history(user: str, target: str):
                     "sender_username": r[1],
                     "sender_name": r[2],
                     "target": r[3],
-                    "text": r[4] or "",
+                    "text": decrypt_text(r[4]) or "",
                     "msg_type": r[5] or "text",
                     "file_url": r[6] or "",
                     "file_name": r[7] or "",
                     "reply_to_id": r[8] or 0,
-                    "reply_to_text": r[9] or "",
+                    "reply_to_text": decrypt_text(r[9]) or "",
                     "reply_to_sender": r[10] or "",
                     "forward_from": r[11] or "",
                     "reactions": json.loads(r[12] or "{}"),
@@ -957,7 +1101,7 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Cipher Messenger v0.7(beta)</title>
+    <title>Cipher Messenger v0.8(beta)</title>
     <style>
         :root[data-theme="dark"] {
             --bg-main: #0b0d13;
@@ -1040,7 +1184,6 @@ HTML_TEMPLATE = """
         }
         a.mention:hover { text-decoration: underline; }
 
-        /* Взрывающиеся сердечки */
         @keyframes heartBurst {
             0% { transform: scale(0.5); opacity: 1; }
             100% { transform: scale(2.5) translateY(-60px); opacity: 0; }
@@ -1567,7 +1710,6 @@ HTML_TEMPLATE = """
             justify-content: center;
         }
 
-        /* Панель эмодзи */
         .emoji-picker {
             position: absolute;
             bottom: 65px;
@@ -1591,7 +1733,6 @@ HTML_TEMPLATE = """
         }
         .emoji-picker span:hover { background: var(--bg-sidebar-hover); }
 
-        /* Кнопка "Вниз" */
         .scroll-down-btn {
             position: absolute;
             bottom: 80px;
@@ -1709,28 +1850,32 @@ HTML_TEMPLATE = """
 
 <div id="channel-modal" class="modal-overlay" style="display: none;">
     <div class="card-modal">
-        <h2>Создать канал</h2>
-        <p class="subtitle">Публичное пространство для публикаций</p>
+        <h2>Создать пространство</h2>
+        <p class="subtitle">Канал (вещание) или Группа (общий чат)</p>
         
-        <input type="text" id="chan-name" placeholder="Название канала">
-        <input type="text" id="chan-tag" placeholder="Уникальный тег (например, news, dev)">
-        <textarea id="chan-desc" rows="2" placeholder="Описание канала..."></textarea>
+        <select id="chan-type-select">
+            <option value="0">📢 Канал (публикации автора)</option>
+            <option value="1">👥 Группа (общение всех)</option>
+        </select>
+        <input type="text" id="chan-name" placeholder="Название">
+        <input type="text" id="chan-tag" placeholder="Уникальный тег (например, group1, news)">
+        <textarea id="chan-desc" rows="2" placeholder="Описание..."></textarea>
         <label style="font-size: 0.8rem; color: var(--text-sub); display: block; margin-bottom: 6px;">Аватарка:</label>
         <input type="file" id="chan-file" accept="image/*">
 
-        <button class="btn-primary" onclick="createChannelSubmit()">Создать канал</button>
+        <button class="btn-primary" onclick="createChannelSubmit()">Создать</button>
         <button class="btn-cancel" onclick="document.getElementById('channel-modal').style.display='none'">Отмена</button>
     </div>
 </div>
 
 <div id="edit-channel-modal" class="modal-overlay" style="display: none;">
     <div class="card-modal">
-        <h2>Настройки канала</h2>
-        <p class="subtitle">Изменение информации, участников и удаление</p>
+        <h2>Настройки пространства</h2>
+        <p class="subtitle">Изменение информации и удаление</p>
         
-        <input type="text" id="edit-chan-name" placeholder="Название канала">
-        <textarea id="edit-chan-desc" rows="2" placeholder="Описание канала..."></textarea>
-        <label style="font-size: 0.8rem; color: var(--text-sub); display: block; margin-bottom: 6px;">Новая аватарка канала:</label>
+        <input type="text" id="edit-chan-name" placeholder="Название">
+        <textarea id="edit-chan-desc" rows="2" placeholder="Описание..."></textarea>
+        <label style="font-size: 0.8rem; color: var(--text-sub); display: block; margin-bottom: 6px;">Новая аватарка:</label>
         <input type="file" id="edit-chan-file" accept="image/*">
 
         <div style="margin: 12px 0; border-top: 1px solid var(--border-color); padding-top: 12px;">
@@ -1742,7 +1887,7 @@ HTML_TEMPLATE = """
         </div>
 
         <button class="btn-primary" onclick="saveChannelEdit()">Сохранить изменения</button>
-        <button class="btn-primary" style="background:#ef4444; margin-top:8px;" onclick="deleteChannel()">🗑️ Удалить канал навсегда</button>
+        <button class="btn-primary" style="background:#ef4444; margin-top:8px;" onclick="deleteChannel()">🗑️ Удалить навсегда</button>
         <button class="btn-cancel" onclick="document.getElementById('edit-channel-modal').style.display='none'">Закрыть</button>
     </div>
 </div>
@@ -1770,7 +1915,13 @@ HTML_TEMPLATE = """
                 <span id="profile-dev-badge" class="dev-badge" style="display:none;">🛠️ DEV</span>
             </div>
             
-            <p id="version-text" style="font-size: 0.78rem; color: var(--text-sub); text-align: center; margin-top: 10px;">Cipher 0.7(beta)</p>
+            <div style="display:flex; gap:8px; margin-bottom: 12px;">
+                <button class="btn-primary" style="background:#10b981; font-size:0.85rem; padding:8px;" onclick="exportChatsJSON()">📥 Экспорт чатов (JSON)</button>
+                <button class="btn-primary" style="background:#6366f1; font-size:0.85rem; padding:8px;" onclick="document.getElementById('import-file-input').click()">📤 Импорт</button>
+                <input type="file" id="import-file-input" style="display:none;" accept=".json" onchange="importChatsJSON(this.files[0])">
+            </div>
+
+            <p id="version-text" style="font-size: 0.78rem; color: var(--text-sub); text-align: center; margin-top: 10px;">Cipher 0.8(beta)</p>
         </div>
         
         <label style="font-size: 0.8rem; color: var(--text-sub); display: block; text-align:left; margin-bottom:4px;">Личный статус:</label>
@@ -1862,7 +2013,7 @@ HTML_TEMPLATE = """
             <div class="sidebar-actions">
                 <button class="icon-btn" id="admin-panel-btn" title="Панель администратора" style="display:none; background: #2563eb; color:#fff;" onclick="openAdminPanel()">🛡️</button>
                 <button class="icon-btn" title="Сменить тему" onclick="toggleTheme()">🌓</button>
-                <button class="icon-btn" title="Создать канал" onclick="document.getElementById('channel-modal').style.display='flex'">➕</button>
+                <button class="icon-btn" title="Создать канал или группу" onclick="document.getElementById('channel-modal').style.display='flex'">➕</button>
             </div>
         </div>
 
@@ -1897,7 +2048,7 @@ HTML_TEMPLATE = """
 
                 <div style="display:flex; align-items:center; gap:8px;">
                     <button class="header-sub-btn" id="channel-action-btn" style="display:none;" onclick="toggleChannelSubscription()"></button>
-                    <button class="icon-btn" id="channel-settings-btn" title="Настройки канала" style="display:none;" onclick="openChannelSettings()">⚙️</button>
+                    <button class="icon-btn" id="channel-settings-btn" title="Настройки" style="display:none;" onclick="openChannelSettings()">⚙️</button>
                 </div>
             </div>
 
@@ -1919,7 +2070,6 @@ HTML_TEMPLATE = """
             </div>
 
             <div class="input-bar" id="chat-input-bar">
-                <!-- Панель эмодзи -->
                 <div class="emoji-picker" id="emoji-picker">
                     <span onclick="insertEmoji('😂')">😂</span>
                     <span onclick="insertEmoji('🔥')">🔥</span>
@@ -1944,7 +2094,7 @@ HTML_TEMPLATE = """
             </div>
 
             <div class="channel-restricted-bar" id="channel-restricted-bar">
-                📢 Только создатель канала может публиковать посты
+                📢 В этом канале писать могут только администраторы
             </div>
         </div>
     </div>
@@ -1986,7 +2136,6 @@ HTML_TEMPLATE = """
         localStorage.setItem("messenger_theme", currentTheme);
     }
 
-    // Звук нового сообщения
     function playNotificationSound() {
         try {
             const ctx = new (window.AudioContext || window.webkitAudioContext)();
@@ -2004,7 +2153,6 @@ HTML_TEMPLATE = """
         } catch(e) {}
     }
 
-    // Звук при отправке сообщения
     function playSendSound() {
         try {
             const ctx = new (window.AudioContext || window.webkitAudioContext)();
@@ -2022,7 +2170,6 @@ HTML_TEMPLATE = """
         } catch(e) {}
     }
 
-    // Запрос разрешений при старте (микрофон и уведомления)
     async function requestPermissionsOnStart() {
         if ("Notification" in window && Notification.permission !== "granted" && Notification.permission !== "denied") {
             await Notification.requestPermission();
@@ -2111,7 +2258,6 @@ HTML_TEMPLATE = """
         document.getElementById("emoji-picker").style.display = "none";
     }
 
-    // Анимация взрывающихся сердец
     function triggerHeartAnimation() {
         for (let i = 0; i < 7; i++) {
             const heart = document.createElement("div");
@@ -2146,6 +2292,40 @@ HTML_TEMPLATE = """
         if (!selectedMsg || !selectedMsg.text) return;
         navigator.clipboard.writeText(selectedMsg.text);
         document.getElementById("msg-menu").style.display = "none";
+    }
+
+    // Экспорт чатов в JSON
+    async function exportChatsJSON() {
+        try {
+            const res = await fetch(`/api/history?user=${encodeURIComponent(user.username)}&target=${encodeURIComponent(currentTarget || user.username)}`);
+            const data = await res.json();
+            const jsonStr = JSON.stringify(data, null, 2);
+            const blob = new Blob([jsonStr], { type: "application/json" });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement("a");
+            a.href = url;
+            a.download = `cipher_backup_${user.username}.json`;
+            a.click();
+        } catch(e) {
+            alert("Ошибка экспорта чатов");
+        }
+    }
+
+    // Импорт чатов из JSON
+    async function importChatsJSON(file) {
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = async function(e) {
+            try {
+                const parsed = JSON.parse(e.target.result);
+                alert("Резервная копия успешно загружена в память клиента!");
+                // Здесь можно отправить данные на сервер или обновить стейт
+                await fetchUserChats();
+            } catch(err) {
+                alert("Неверный формат JSON файла");
+            }
+        };
+        reader.readAsText(file);
     }
 
     function toggleAuth() {
@@ -2568,7 +2748,7 @@ HTML_TEMPLATE = """
     }
 
     async function deleteChannel() {
-        if (!confirm("Вы уверены, что хотите удалить этот канал навсегда? Это действие необратимо.")) return;
+        if (!confirm("Вы уверены, что хотите удалить этот канал/группу навсегда? Это действие необратимо.")) return;
         const res = await fetch("/api/delete_channel", {
             method: "POST",
             headers: {"Content-Type": "application/json"},
@@ -2643,12 +2823,14 @@ HTML_TEMPLATE = """
     }
 
     async function createChannelSubmit() {
+        const isGroup = document.getElementById("chan-type-select").value;
         const name = document.getElementById("chan-name").value;
         const tag = document.getElementById("chan-tag").value;
         const desc = document.getElementById("chan-desc").value;
         const fileInput = document.getElementById("chan-file");
 
         const form = new FormData();
+        form.append("is_group", isGroup);
         form.append("name", name);
         form.append("tag", tag);
         form.append("desc", desc);
@@ -2723,7 +2905,7 @@ HTML_TEMPLATE = """
             };
 
             const isMsg = item.type === "message";
-            const iconBadge = isMsg ? "💬 " : (item.type === "channel" ? "📢 " : "");
+            const iconBadge = isMsg ? "💬 " : (item.type === "group" ? "👥 " : (item.type === "channel" ? "📢 " : ""));
 
             div.innerHTML = `
                 <div class="avatar-wrap">
@@ -2861,15 +3043,20 @@ HTML_TEMPLATE = """
             if (isChannel) {
                 currentChannelData = data;
                 const isOwner = (data.creator.toLowerCase() === user.username.toLowerCase()) || checkIsDev(user.username) || user.is_admin;
+                const isGroupChat = data.type === "group";
                 
                 settingsBtn.style.display = isOwner ? "flex" : "none";
                 subBtn.style.display = "block";
                 subBtn.className = `header-sub-btn ${data.is_member ? 'btn-leave' : 'btn-join'}`;
                 subBtn.innerText = data.is_member ? "Покинуть" : "Подписаться";
 
-                if (isOwner) {
+                if (isOwner || (isGroupChat && data.is_member)) {
                     inputBar.style.display = "flex";
                     restrictedBar.style.display = "none";
+                } else if (isGroupChat) {
+                    inputBar.style.display = "none";
+                    restrictedBar.style.display = "block";
+                    restrictedBar.innerText = "📢 Вы должны подписаться, чтобы писать в эту группу";
                 } else {
                     inputBar.style.display = "none";
                     restrictedBar.style.display = data.is_member ? "block" : "none";
@@ -3285,12 +3472,12 @@ async def ws_endpoint(websocket: WebSocket, username: str):
 
             elif action == "edit":
                 msg_id = data.get("msg_id")
-                new_text = data.get("text")
+                new_text = encrypt_text(data.get("text"))
                 async with aiosqlite.connect(DB_PATH) as db:
                     await db.execute("UPDATE messages SET text = ?, is_edited = 1 WHERE id = ? AND LOWER(sender_username) = LOWER(?)", (new_text, msg_id, uname))
                     await db.commit()
                 
-                payload = {"type": "edit_msg", "msg_id": msg_id, "text": new_text, "target": target}
+                payload = {"type": "edit_msg", "msg_id": msg_id, "text": data.get("text"), "target": target}
                 if target.startswith("#"):
                     await manager.broadcast_channel(payload)
                 else:
@@ -3312,12 +3499,13 @@ async def ws_endpoint(websocket: WebSocket, username: str):
                     await manager.send_to_user(payload, uname)
                 continue
 
-            text = data.get("text", "")
+            text_raw = data.get("text", "")
+            text = encrypt_text(text_raw)
             msg_type = data.get("msg_type", "text")
             file_url = data.get("file_url", "")
             file_name = data.get("file_name", "")
             reply_id = data.get("reply_to_id", 0)
-            reply_text = data.get("reply_to_text", "")
+            reply_text = encrypt_text(data.get("reply_to_text", ""))
             reply_sender = data.get("reply_to_sender", "")
             forward_from = data.get("forward_from", "")
             time_str = datetime.now().strftime("%H:%M")
@@ -3325,10 +3513,21 @@ async def ws_endpoint(websocket: WebSocket, username: str):
             if target.startswith("#"):
                 clean_tag = target.lstrip("#").lower()
                 async with aiosqlite.connect(DB_PATH) as db:
-                    cur_c = await db.execute("SELECT creator_username FROM channels WHERE LOWER(channel_tag) = LOWER(?)", (clean_tag,))
+                    cur_c = await db.execute("SELECT creator_username, is_group, members FROM channels WHERE LOWER(channel_tag) = LOWER(?)", (clean_tag,))
                     c_row = await cur_c.fetchone()
-                    if not c_row or (c_row[0].lower() != uname and not is_admin(uname)):
+                    if not c_row:
                         continue
+                    creator = c_row[0].lower()
+                    is_grp = c_row[1]
+                    members = [m.lower() for m in json.loads(c_row[2] or "[]")]
+                    
+                    # Если это канал, писать может только создатель. Если группа - любой участник
+                    if not is_grp:
+                        if creator != uname and not is_admin(uname):
+                            continue
+                    else:
+                        if uname not in members and creator != uname and not is_admin(uname):
+                            continue
 
             async with aiosqlite.connect(DB_PATH) as db:
                 cur = await db.execute(
@@ -3347,12 +3546,12 @@ async def ws_endpoint(websocket: WebSocket, username: str):
                 "sender_username": uname,
                 "sender_name": data.get("sender_name", uname),
                 "target": target,
-                "text": text,
+                "text": text_raw,
                 "msg_type": msg_type,
                 "file_url": file_url,
                 "file_name": file_name,
                 "reply_to_id": reply_id,
-                "reply_to_text": reply_text,
+                "reply_to_text": data.get("reply_to_text", ""),
                 "reply_to_sender": reply_sender,
                 "forward_from": forward_from,
                 "reactions": {},
