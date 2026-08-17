@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
 
-app = FastAPI(title="Cipher Messenger Pro")
+app = FastAPI(title="Cipher Messenger Mega")
 
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -53,7 +53,6 @@ def calculate_score(query: str, target: str) -> int:
         return 80
     if q in t:
         return 50
-    # Проверка совпадения без спецсимволов
     if normalize_text(q) in normalize_text(t):
         return 30
     return 0
@@ -68,6 +67,8 @@ async def init_db():
                 display_name TEXT NOT NULL,
                 password_hash TEXT NOT NULL,
                 avatar_url TEXT DEFAULT '',
+                custom_status TEXT DEFAULT 'online',
+                last_seen TEXT DEFAULT '',
                 created_at TEXT NOT NULL
             )
         """)
@@ -80,6 +81,8 @@ async def init_db():
                 creator_username TEXT NOT NULL,
                 avatar_url TEXT DEFAULT '',
                 pinned_msg_id INTEGER DEFAULT 0,
+                is_group INTEGER DEFAULT 0,
+                members TEXT DEFAULT '[]',
                 created_at TEXT NOT NULL
             )
         """)
@@ -96,7 +99,9 @@ async def init_db():
                 reply_to_id INTEGER DEFAULT 0,
                 reply_to_text TEXT DEFAULT '',
                 reply_to_sender TEXT DEFAULT '',
+                forward_from TEXT DEFAULT '',
                 reactions TEXT DEFAULT '{}',
+                is_read INTEGER DEFAULT 0,
                 is_edited INTEGER DEFAULT 0,
                 is_deleted INTEGER DEFAULT 0,
                 timestamp TEXT NOT NULL,
@@ -125,6 +130,10 @@ class ConnectionManager:
     async def disconnect(self, username: str):
         if username in self.active_connections:
             del self.active_connections[username]
+            time_now = datetime.now().strftime("%H:%M")
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute("UPDATE users SET last_seen = ? WHERE username = ?", (time_now, username))
+                await db.commit()
         await self.broadcast_online()
 
     async def broadcast_online(self):
@@ -143,13 +152,12 @@ class ConnectionManager:
             except Exception:
                 pass
 
-    async def broadcast(self, message: dict, sender_username: str = None):
+    async def broadcast_channel(self, message: dict, sender_username: str = None):
         for uname, conn in list(self.active_connections.items()):
-            if uname != sender_username:
-                try:
-                    await conn.send_text(json.dumps(message))
-                except Exception:
-                    pass
+            try:
+                await conn.send_text(json.dumps(message))
+            except Exception:
+                pass
 
 manager = ConnectionManager()
 
@@ -170,6 +178,10 @@ class LoginModel(BaseModel):
 class BlockModel(BaseModel):
     blocker: str
     blocked: str
+
+class StatusModel(BaseModel):
+    username: str
+    status: str
 
 @app.post("/api/register")
 async def register(data: RegisterModel):
@@ -203,6 +215,7 @@ async def register(data: RegisterModel):
             "display_name": name,
             "email": email,
             "avatar_url": "",
+            "custom_status": "online",
             "is_dev": is_dev(uname)
         }
 
@@ -213,7 +226,7 @@ async def login(data: LoginModel):
 
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            """SELECT username, display_name, email, avatar_url 
+            """SELECT username, display_name, email, avatar_url, custom_status 
                FROM users 
                WHERE (email = ? OR username = ?) AND password_hash = ?""",
             (login_val, login_val, pwd_hash)
@@ -226,6 +239,7 @@ async def login(data: LoginModel):
                 "display_name": user[1],
                 "email": user[2],
                 "avatar_url": user[3] or "",
+                "custom_status": user[4] or "online",
                 "is_dev": is_dev(user[0])
             }
         return {"status": "error", "message": "Неверный логин или пароль"}
@@ -243,14 +257,10 @@ async def upload_file_endpoint(file: UploadFile = File(...)):
     is_vid = ext in ["mp4", "webm", "mov", "avi", "mkv"]
     is_audio = ext in ["webm", "ogg", "mp3", "wav", "m4a", "aac"]
 
-    if is_img:
-        file_type = "image"
-    elif is_vid:
-        file_type = "video"
-    elif is_audio:
-        file_type = "voice"
-    else:
-        file_type = "document"
+    if is_img: file_type = "image"
+    elif is_vid: file_type = "video"
+    elif is_audio: file_type = "voice"
+    else: file_type = "document"
 
     return {
         "status": "ok",
@@ -276,12 +286,19 @@ async def upload_avatar(username: str = Form(...), file: UploadFile = File(...))
 
     return {"status": "ok", "avatar_url": avatar_url}
 
+@app.post("/api/update_status")
+async def update_status(data: StatusModel):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE users SET custom_status = ? WHERE username = ?", (data.status, data.username))
+        await db.commit()
+    return {"status": "ok"}
+
 @app.post("/api/create_channel")
-async def create_channel(tag: str = Form(...), name: str = Form(...), desc: str = Form(""), creator: str = Form(...), file: UploadFile = File(None)):
+async def create_channel(tag: str = Form(...), name: str = Form(...), desc: str = Form(""), creator: str = Form(...), is_group: int = Form(0), members: str = Form("[]"), file: UploadFile = File(None)):
     clean_tag = tag.strip().lstrip("#").lower()
     clean_name = name.strip()
     if not clean_tag or not clean_name:
-        return {"status": "error", "message": "Укажите название и тег канала"}
+        return {"status": "error", "message": "Укажите название и тег"}
 
     avatar_url = ""
     if file and file.filename:
@@ -295,22 +312,51 @@ async def create_channel(tag: str = Form(...), name: str = Form(...), desc: str 
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("SELECT id FROM channels WHERE channel_tag = ?", (clean_tag,))
         if await cur.fetchone():
-            return {"status": "error", "message": "Канал с таким тегом уже существует"}
+            return {"status": "error", "message": "Канал/группа с таким тегом уже существует"}
 
         created_at = datetime.now().strftime("%Y-%m-%d %H:%M")
         await db.execute(
-            "INSERT INTO channels (channel_tag, name, description, creator_username, avatar_url, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (clean_tag, clean_name, desc, creator, avatar_url, created_at)
+            """INSERT INTO channels (channel_tag, name, description, creator_username, avatar_url, is_group, members, created_at) 
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (clean_tag, clean_name, desc, creator, avatar_url, is_group, members, created_at)
         )
         await db.commit()
 
     return {"status": "ok", "channel_tag": clean_tag, "name": clean_name, "avatar_url": avatar_url}
 
+@app.post("/api/update_channel")
+async def update_channel(tag: str = Form(...), name: str = Form(...), desc: str = Form(""), requester: str = Form(...), file: UploadFile = File(None)):
+    clean_tag = tag.strip().lstrip("#").lower()
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT creator_username, avatar_url FROM channels WHERE channel_tag = ?", (clean_tag,))
+        row = await cur.fetchone()
+        if not row:
+            return {"status": "error", "message": "Канал не найден"}
+        if row[0] != requester and not is_dev(requester):
+            return {"status": "error", "message": "Только создатель может менять канал"}
+
+        avatar_url = row[1]
+        if file and file.filename:
+            ext = file.filename.split(".")[-1].lower()
+            filename = f"chan_{clean_tag}_{uuid.uuid4().hex[:8]}.{ext}"
+            path = os.path.join(UPLOAD_DIR, filename)
+            with open(path, "wb") as buf:
+                shutil.copyfileobj(file.file, buf)
+            avatar_url = f"/uploads/{filename}"
+
+        await db.execute(
+            "UPDATE channels SET name = ?, description = ?, avatar_url = ? WHERE channel_tag = ?",
+            (name.strip(), desc.strip(), avatar_url, clean_tag)
+        )
+        await db.commit()
+
+    return {"status": "ok", "name": name.strip(), "description": desc.strip(), "avatar_url": avatar_url}
+
 @app.get("/api/user_info")
 async def get_user_info(username: str, current_user: str):
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "SELECT username, display_name, email, avatar_url, created_at FROM users WHERE username = ?",
+            "SELECT username, display_name, email, avatar_url, created_at, custom_status, last_seen FROM users WHERE username = ?",
             (username.strip().lstrip("@"),)
         )
         row = await cur.fetchone()
@@ -327,6 +373,8 @@ async def get_user_info(username: str, current_user: str):
             "email": row[2],
             "avatar_url": row[3] or "",
             "created_at": row[4],
+            "custom_status": row[5] or "online",
+            "last_seen": row[6] or "",
             "is_dev": is_dev(row[0]),
             "is_blocked": is_blocked
         }
@@ -352,8 +400,8 @@ async def get_user_chats(username: str):
         cur_blk = await db.execute("SELECT blocked FROM blocks WHERE blocker = ?", (username,))
         blocked_list = [r[0] for r in await cur_blk.fetchall()]
 
-        # Каналы
-        cur_ch = await db.execute("SELECT channel_tag, name, avatar_url, pinned_msg_id FROM channels")
+        # Каналы и Группы
+        cur_ch = await db.execute("SELECT channel_tag, name, avatar_url, pinned_msg_id, is_group, description, creator_username FROM channels")
         for ch in await cur_ch.fetchall():
             tag_key = f"#{ch[0]}"
             cur_last = await db.execute(
@@ -361,7 +409,7 @@ async def get_user_chats(username: str):
                 (tag_key,)
             )
             last = await cur_last.fetchone()
-            last_text = "Канал создан"
+            last_text = "Группа создана" if ch[4] else "Канал создан"
             if last:
                 if last[1] == "voice": last_text = "🎙️ Голосовое"
                 elif last[1] == "image": last_text = "📷 Фотография"
@@ -372,11 +420,13 @@ async def get_user_chats(username: str):
                 "key": tag_key,
                 "name": ch[1],
                 "tag": tag_key,
-                "type": "channel",
+                "type": "group" if ch[4] else "channel",
                 "avatar": ch[2] or "",
                 "last_msg": last_text,
                 "time": last[2] if last else "",
                 "pinned_id": ch[3] or 0,
+                "desc": ch[5] or "",
+                "creator": ch[6],
                 "is_dev": False,
                 "is_blocked": False
             })
@@ -393,19 +443,25 @@ async def get_user_chats(username: str):
         peers = [r[0] for r in await cur_peers.fetchall() if r[0] != username and not r[0].startswith("#")]
 
         for p in peers:
-            cur_u = await db.execute("SELECT display_name, avatar_url FROM users WHERE username = ?", (p,))
+            cur_u = await db.execute("SELECT display_name, avatar_url, custom_status, last_seen FROM users WHERE username = ?", (p,))
             u_data = await cur_u.fetchone()
             name = u_data[0] if u_data else p
             avatar = u_data[1] if u_data else ""
+            status = u_data[2] if u_data else "online"
+            last_seen = u_data[3] if u_data else ""
             
             cur_last = await db.execute("""
-                SELECT text, msg_type, timestamp FROM messages 
+                SELECT text, msg_type, timestamp, is_read, sender_username FROM messages 
                 WHERE ((sender_username = ? AND target = ?) OR (sender_username = ? AND target = ?)) AND is_deleted = 0
                 ORDER BY id DESC LIMIT 1
             """, (username, p, p, username))
             last = await cur_last.fetchone()
             last_text = ""
+            last_read = 0
+            last_sender = ""
             if last:
+                last_read = last[3]
+                last_sender = last[4]
                 if last[1] == "voice": last_text = "🎙️ Голосовое"
                 elif last[1] == "image": last_text = "📷 Фотография"
                 elif last[1] == "video": last_text = "🎬 Видео"
@@ -417,7 +473,11 @@ async def get_user_chats(username: str):
                 "tag": f"@{p}",
                 "type": "user",
                 "avatar": avatar,
+                "custom_status": status,
+                "last_seen": last_seen,
                 "last_msg": last_text,
+                "last_read": last_read,
+                "last_sender": last_sender,
                 "time": last[2] if last else "",
                 "pinned_id": 0,
                 "is_dev": is_dev(p),
@@ -426,7 +486,6 @@ async def get_user_chats(username: str):
 
         return {"chats": chats}
 
-# 🚀 УЛУЧШЕННЫЙ ПОИСК С РАНЖИРОВАНИЕМ, СООБЩЕНИЯМИ И EMAIL
 @app.get("/api/search")
 async def search(q: str, current_user: str = "", offset: int = 0, limit: int = 15):
     raw_query = q.strip()
@@ -436,7 +495,6 @@ async def search(q: str, current_user: str = "", offset: int = 0, limit: int = 1
 
     results = []
     async with aiosqlite.connect(DB_PATH) as db:
-        # 1. Поиск по пользователям (Username, Имя, Email)
         cur_u = await db.execute("SELECT username, display_name, email, avatar_url FROM users")
         for r in await cur_u.fetchall():
             uname, dname, email, avatar = r[0], r[1], r[2], r[3]
@@ -444,7 +502,6 @@ async def search(q: str, current_user: str = "", offset: int = 0, limit: int = 1
             s2 = calculate_score(clean_q, dname)
             s3 = calculate_score(clean_q, email)
             final_score = max(s1, s2, s3)
-            
             if final_score > 0:
                 results.append({
                     "score": final_score,
@@ -457,28 +514,25 @@ async def search(q: str, current_user: str = "", offset: int = 0, limit: int = 1
                     "is_dev": is_dev(uname)
                 })
 
-        # 2. Поиск по каналам (Тег, Название, Описание)
-        cur_c = await db.execute("SELECT channel_tag, name, avatar_url, description FROM channels")
+        cur_c = await db.execute("SELECT channel_tag, name, avatar_url, description, is_group FROM channels")
         for r in await cur_c.fetchall():
-            tag, name, avatar, desc = r[0], r[1], r[2], r[3] or ""
+            tag, name, avatar, desc, is_grp = r[0], r[1], r[2], r[3] or "", r[4]
             s1 = calculate_score(clean_q, tag)
             s2 = calculate_score(clean_q, name)
             s3 = calculate_score(clean_q, desc) // 2
             final_score = max(s1, s2, s3)
-
             if final_score > 0:
                 results.append({
                     "score": final_score,
-                    "type": "channel",
+                    "type": "group" if is_grp else "channel",
                     "key": f"#{tag}",
                     "tag": f"#{tag}",
                     "name": name,
-                    "extra": desc or "Канал",
+                    "extra": desc or ("Группа" if is_grp else "Канал"),
                     "avatar": avatar or "",
                     "is_dev": False
                 })
 
-        # 3. Поиск по сообщениям
         if current_user:
             cur_m = await db.execute("""
                 SELECT id, sender_username, sender_name, target, text, timestamp 
@@ -503,11 +557,9 @@ async def search(q: str, current_user: str = "", offset: int = 0, limit: int = 1
                         "is_dev": False
                     })
 
-    # Сортировка по очкам релевантности (ранжирование)
     results.sort(key=lambda x: x["score"], reverse=True)
     paged_results = results[offset : offset + limit]
     has_more = (offset + limit) < len(results)
-
     return {"results": paged_results, "has_more": has_more, "total": len(results)}
 
 @app.get("/api/history")
@@ -516,14 +568,17 @@ async def get_history(user: str, target: str):
         if target.startswith("#"):
             cur = await db.execute(
                 """SELECT id, sender_username, sender_name, target, text, msg_type, file_url, file_name, 
-                          reply_to_id, reply_to_text, reply_to_sender, reactions, is_edited, is_deleted, timestamp, avatar_url 
+                          reply_to_id, reply_to_text, reply_to_sender, forward_from, reactions, is_read, is_edited, is_deleted, timestamp, avatar_url 
                    FROM messages WHERE target = ? AND is_deleted = 0 ORDER BY id ASC LIMIT 250""",
                 (target,)
             )
         else:
+            await db.execute("UPDATE messages SET is_read = 1 WHERE sender_username = ? AND target = ?", (target, user))
+            await db.commit()
+
             cur = await db.execute(
                 """SELECT id, sender_username, sender_name, target, text, msg_type, file_url, file_name, 
-                          reply_to_id, reply_to_text, reply_to_sender, reactions, is_edited, is_deleted, timestamp, avatar_url 
+                          reply_to_id, reply_to_text, reply_to_sender, forward_from, reactions, is_read, is_edited, is_deleted, timestamp, avatar_url 
                    FROM messages 
                    WHERE ((sender_username = ? AND target = ?) OR (sender_username = ? AND target = ?)) 
                      AND is_deleted = 0
@@ -543,22 +598,24 @@ async def get_history(user: str, target: str):
             "reply_to_id": r[8],
             "reply_to_text": r[9],
             "reply_to_sender": r[10],
-            "reactions": json.loads(r[11] or "{}"),
-            "is_edited": bool(r[12]),
-            "time": r[14],
-            "avatar": r[15],
+            "forward_from": r[11],
+            "reactions": json.loads(r[12] or "{}"),
+            "is_read": bool(r[13]),
+            "is_edited": bool(r[14]),
+            "time": r[16],
+            "avatar": r[17],
             "is_dev": is_dev(r[1])
         } for r in rows]
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
-<html lang="ru">
+<html lang="ru" data-theme="dark">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>Cipher Messenger</title>
     <style>
-        :root {
+        :root[data-theme="dark"] {
             --bg-main: #0b0d13;
             --bg-sidebar: #10131c;
             --bg-sidebar-hover: #171b26;
@@ -572,7 +629,26 @@ HTML_TEMPLATE = """
             --badge-blue: #3b82f6;
             --online-green: #10b981;
             --border-color: #171b26;
-            --danger-red: #ef4444;
+            --card-bg: #121520;
+            --card-border: #1e2332;
+        }
+
+        :root[data-theme="light"] {
+            --bg-main: #f0f2f5;
+            --bg-sidebar: #ffffff;
+            --bg-sidebar-hover: #f1f5f9;
+            --bg-chat: #f8fafc;
+            --bg-header: #ffffff;
+            --bg-input: #e2e8f0;
+            --bubble-in: #ffffff;
+            --bubble-out: #2563eb;
+            --text-main: #0f172a;
+            --text-sub: #64748b;
+            --badge-blue: #2563eb;
+            --online-green: #16a34a;
+            --border-color: #e2e8f0;
+            --card-bg: #ffffff;
+            --card-border: #cbd5e1;
         }
 
         * {
@@ -588,11 +664,12 @@ HTML_TEMPLATE = """
             background-color: var(--bg-main);
             color: var(--text-main);
             overflow: hidden;
+            transition: background-color 0.2s, color 0.2s;
         }
 
         .dev-badge {
             background: linear-gradient(135deg, #8b5cf6, #ec4899);
-            color: #fff;
+            color: #fff !important;
             font-size: 0.65rem;
             font-weight: 800;
             padding: 2px 6px;
@@ -611,24 +688,32 @@ HTML_TEMPLATE = """
             padding: 0 2px;
         }
 
+        a.mention {
+            color: var(--badge-blue);
+            text-decoration: none;
+            font-weight: 600;
+            cursor: pointer;
+        }
+        a.mention:hover { text-decoration: underline; }
+
         .modal-overlay {
             position: fixed;
             inset: 0;
-            background: rgba(6, 8, 12, 0.94);
-            backdrop-filter: blur(10px);
+            background: rgba(0, 0, 0, 0.75);
+            backdrop-filter: blur(8px);
             display: flex;
             align-items: center;
             justify-content: center;
             z-index: 1000;
         }
         .card-modal {
-            background: #121520;
-            padding: 30px 26px;
+            background: var(--card-bg);
+            padding: 28px 24px;
             border-radius: 20px;
             width: 90%;
-            max-width: 400px;
-            border: 1px solid #1e2332;
-            box-shadow: 0 25px 50px rgba(0,0,0,0.7);
+            max-width: 420px;
+            border: 1px solid var(--card-border);
+            box-shadow: 0 25px 50px rgba(0,0,0,0.5);
         }
         .brand-logo {
             display: flex;
@@ -638,20 +723,20 @@ HTML_TEMPLATE = """
             font-size: 1.6rem;
             font-weight: 800;
             letter-spacing: 1px;
-            color: #fff;
+            color: var(--text-main);
             margin-bottom: 4px;
         }
         .brand-logo span { color: var(--badge-blue); }
-        .card-modal h2 { font-size: 1.3rem; font-weight: 700; margin-bottom: 4px; text-align: center; }
-        .card-modal p.subtitle { font-size: 0.85rem; color: var(--text-sub); margin-bottom: 20px; text-align: center; }
+        .card-modal h2 { font-size: 1.3rem; font-weight: 700; margin-bottom: 4px; text-align: center; color: var(--text-main); }
+        .card-modal p.subtitle { font-size: 0.85rem; color: var(--text-sub); margin-bottom: 18px; text-align: center; }
         
-        .card-modal input, .card-modal textarea {
+        .card-modal input, .card-modal textarea, .card-modal select {
             width: 100%;
             padding: 12px 14px;
             margin-bottom: 12px;
             background: var(--bg-input);
-            border: 1px solid #202636;
-            color: #fff;
+            border: 1px solid var(--card-border);
+            color: var(--text-main);
             border-radius: 12px;
             outline: none;
             font-size: 0.95rem;
@@ -713,7 +798,7 @@ HTML_TEMPLATE = """
             border-radius: 12px;
             transition: background 0.2s;
         }
-        .user-profile-badge:hover { background: #171b26; }
+        .user-profile-badge:hover { background: var(--bg-sidebar-hover); }
         .avatar-small {
             width: 38px;
             height: 38px;
@@ -731,8 +816,8 @@ HTML_TEMPLATE = """
         .sidebar-actions { display: flex; gap: 8px; }
         .icon-btn {
             background: var(--bg-input);
-            border: 1px solid #1e2332;
-            color: #fff;
+            border: 1px solid var(--border-color);
+            color: var(--text-main);
             width: 38px;
             height: 38px;
             border-radius: 12px;
@@ -743,7 +828,7 @@ HTML_TEMPLATE = """
             font-size: 1.1rem;
             transition: 0.2s;
         }
-        .icon-btn:hover { background: #202636; }
+        .icon-btn:hover { opacity: 0.8; }
 
         .search-container {
             padding: 8px 16px 14px 16px;
@@ -754,9 +839,9 @@ HTML_TEMPLATE = """
             width: 100%;
             padding: 11px 14px 11px 36px;
             background: var(--bg-input);
-            border: 1px solid #1e2332;
+            border: 1px solid var(--border-color);
             border-radius: 12px;
-            color: #fff;
+            color: var(--text-main);
             outline: none;
             font-size: 0.9rem;
         }
@@ -777,7 +862,7 @@ HTML_TEMPLATE = """
             transition: background 0.15s;
         }
         .chat-item:hover { background: var(--bg-sidebar-hover); }
-        .chat-item.active { background: #171b28; }
+        .chat-item.active { background: var(--bg-sidebar-hover); }
 
         .avatar-wrap {
             position: relative;
@@ -808,6 +893,7 @@ HTML_TEMPLATE = """
             display: none;
         }
         .online-dot.visible { display: block; }
+        .online-dot.dnd { background: #ef4444; display: block; }
 
         .chat-details { flex: 1; min-width: 0; }
         .chat-top-row {
@@ -819,7 +905,7 @@ HTML_TEMPLATE = """
         .chat-name {
             font-weight: 600;
             font-size: 0.96rem;
-            color: #ffffff;
+            color: var(--text-main);
             white-space: nowrap;
             overflow: hidden;
             text-overflow: ellipsis;
@@ -862,6 +948,7 @@ HTML_TEMPLATE = """
             background: var(--bg-header);
             display: flex;
             align-items: center;
+            justify-content: space-between;
             padding: 0 20px;
             border-bottom: 1px solid var(--border-color);
             flex-shrink: 0;
@@ -870,19 +957,19 @@ HTML_TEMPLATE = """
             display: none;
             background: none;
             border: none;
-            color: #fff;
+            color: var(--text-main);
             font-size: 1.4rem;
             margin-right: 14px;
             cursor: pointer;
         }
 
         .pinned-banner {
-            background: #151924;
+            background: var(--bg-sidebar-hover);
             padding: 8px 18px;
             display: none;
             align-items: center;
             justify-content: space-between;
-            border-bottom: 1px solid #1e2434;
+            border-bottom: 1px solid var(--border-color);
             font-size: 0.82rem;
             cursor: pointer;
         }
@@ -923,10 +1010,11 @@ HTML_TEMPLATE = """
             word-break: break-word;
             position: relative;
             cursor: pointer;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
         }
         .msg-row.theirs .bubble {
             background: var(--bubble-in);
-            color: #f1f2f6;
+            color: var(--text-main);
             border-bottom-left-radius: 4px;
         }
         .msg-row.mine .bubble {
@@ -945,14 +1033,19 @@ HTML_TEMPLATE = """
             gap: 6px;
         }
         .bubble-reply {
-            background: rgba(0, 0, 0, 0.25);
+            background: rgba(0, 0, 0, 0.15);
             border-left: 3px solid var(--badge-blue);
             padding: 4px 8px;
             border-radius: 4px;
             margin-bottom: 6px;
             font-size: 0.78rem;
         }
-        .bubble-reply .reply-user { font-weight: 600; color: #93c5fd; }
+        .bubble-fwd {
+            font-size: 0.75rem;
+            color: #93c5fd;
+            margin-bottom: 4px;
+            font-style: italic;
+        }
         
         .bubble-img {
             max-width: 100%;
@@ -985,11 +1078,11 @@ HTML_TEMPLATE = """
             display: flex;
             align-items: center;
             gap: 8px;
-            background: rgba(0,0,0,0.25);
+            background: rgba(0,0,0,0.15);
             padding: 8px 12px;
             border-radius: 8px;
             text-decoration: none;
-            color: #fff;
+            color: inherit;
             font-size: 0.85rem;
             margin-top: 4px;
         }
@@ -1001,7 +1094,8 @@ HTML_TEMPLATE = """
             gap: 4px;
             margin-top: 4px;
         }
-        .bubble-time { font-size: 0.68rem; color: rgba(255, 255, 255, 0.6); }
+        .bubble-time { font-size: 0.68rem; opacity: 0.7; }
+        .read-status { font-size: 0.75rem; color: #60a5fa; font-weight: bold; }
 
         .reactions-row {
             display: flex;
@@ -1010,7 +1104,7 @@ HTML_TEMPLATE = """
             margin-top: 4px;
         }
         .reaction-chip {
-            background: rgba(255, 255, 255, 0.12);
+            background: rgba(0, 0, 0, 0.15);
             border-radius: 12px;
             padding: 2px 7px;
             font-size: 0.75rem;
@@ -1018,10 +1112,11 @@ HTML_TEMPLATE = """
             align-items: center;
             gap: 4px;
             cursor: pointer;
+            position: relative;
         }
 
         .action-banner {
-            background: #141722;
+            background: var(--bg-sidebar-hover);
             padding: 8px 18px;
             display: none;
             align-items: center;
@@ -1043,7 +1138,7 @@ HTML_TEMPLATE = """
         .input-wrapper {
             flex: 1;
             background: var(--bg-input);
-            border: 1px solid #1e2332;
+            border: 1px solid var(--border-color);
             border-radius: 14px;
             padding: 0 14px;
             display: flex;
@@ -1054,7 +1149,7 @@ HTML_TEMPLATE = """
             flex: 1;
             background: transparent;
             border: none;
-            color: #fff;
+            color: var(--text-main);
             padding: 12px 0;
             font-size: 0.95rem;
             outline: none;
@@ -1071,8 +1166,8 @@ HTML_TEMPLATE = """
             justify-content: center;
             transition: color 0.2s;
         }
-        .bar-btn:hover { color: #fff; }
-        .bar-btn.recording { color: var(--danger-red); animation: pulse 1s infinite; }
+        .bar-btn:hover { color: var(--text-main); }
+        .bar-btn.recording { color: #ef4444; animation: pulse 1s infinite; }
 
         .send-btn {
             background: var(--badge-blue);
@@ -1088,48 +1183,34 @@ HTML_TEMPLATE = """
             justify-content: center;
         }
 
-        .load-more-btn {
-            background: #181c26;
-            color: var(--badge-blue);
-            border: 1px solid #232738;
-            padding: 10px;
-            border-radius: 10px;
-            margin: 12px 18px;
-            font-weight: 600;
-            font-size: 0.85rem;
-            cursor: pointer;
-            text-align: center;
-        }
-        .load-more-btn:hover { background: #22283a; }
-
         .msg-menu {
             position: fixed;
-            background: #181c28;
-            border: 1px solid #282f42;
+            background: var(--card-bg);
+            border: 1px solid var(--card-border);
             border-radius: 14px;
             padding: 6px;
             display: none;
             flex-direction: column;
             z-index: 2000;
-            box-shadow: 0 10px 30px rgba(0,0,0,0.8);
-            min-width: 170px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+            min-width: 180px;
         }
         .msg-menu-item {
             padding: 9px 14px;
             font-size: 0.85rem;
-            color: #fff;
+            color: var(--text-main);
             border-radius: 8px;
             cursor: pointer;
             display: flex;
             align-items: center;
             gap: 8px;
         }
-        .msg-menu-item:hover { background: #222838; }
+        .msg-menu-item:hover { background: var(--bg-sidebar-hover); }
         .msg-menu-emojis {
             display: flex;
             gap: 6px;
             padding: 6px 10px;
-            border-bottom: 1px solid #282f42;
+            border-bottom: 1px solid var(--border-color);
             font-size: 1.25rem;
             justify-content: space-between;
         }
@@ -1158,13 +1239,17 @@ HTML_TEMPLATE = """
         <span onclick="sendReaction('😂')">😂</span>
         <span onclick="sendReaction('😮')">😮</span>
         <span onclick="sendReaction('👏')">👏</span>
+        <span onclick="sendReaction('🎉')">🎉</span>
+        <span onclick="sendReaction('😢')">😢</span>
     </div>
     <div class="msg-menu-item" onclick="startReply()">💬 Ответить</div>
+    <div class="msg-menu-item" onclick="startForward()">↪️ Переслать</div>
     <div class="msg-menu-item" onclick="pinMessage()">📌 Закрепить</div>
     <div class="msg-menu-item" id="menu-edit-btn" onclick="startEdit()">✏️ Изменить</div>
-    <div class="msg-menu-item" id="menu-del-btn" style="color: var(--danger-red);" onclick="deleteMessage()">🗑️ Удалить</div>
+    <div class="msg-menu-item" id="menu-del-btn" style="color: #ef4444;" onclick="deleteMessage()">🗑️ Удалить</div>
 </div>
 
+<!-- Модалка Авторизации -->
 <div id="auth-modal" class="modal-overlay">
     <div class="card-modal">
         <div class="brand-logo">⚡ CIPHER<span>.</span></div>
@@ -1180,54 +1265,95 @@ HTML_TEMPLATE = """
     </div>
 </div>
 
+<!-- Модалка Создания Канала / Группы -->
 <div id="channel-modal" class="modal-overlay" style="display: none;">
     <div class="card-modal">
-        <h2>Создать канал</h2>
-        <p class="subtitle">Публичное пространство для постов и общения</p>
+        <h2 id="modal-chan-title">Создать канал или группу</h2>
+        <p class="subtitle">Публичное пространство или групповая беседа</p>
         
-        <input type="text" id="chan-name" placeholder="Название канала">
-        <input type="text" id="chan-tag" placeholder="Тег канала (например, dev, music)">
-        <textarea id="chan-desc" rows="2" placeholder="Описание канала..."></textarea>
-        <label style="font-size: 0.8rem; color: var(--text-sub); display: block; margin-bottom: 6px;">Аватарка канала:</label>
+        <select id="chan-type-select" onchange="toggleGroupCreation(this.value)">
+            <option value="0">📢 Канал (вещание)</option>
+            <option value="1">👥 Групповой чат (беседа)</option>
+        </select>
+        <input type="text" id="chan-name" placeholder="Название">
+        <input type="text" id="chan-tag" placeholder="Уникальный тег (например, dev, chat)">
+        <textarea id="chan-desc" rows="2" placeholder="Описание..."></textarea>
+        <label style="font-size: 0.8rem; color: var(--text-sub); display: block; margin-bottom: 6px;">Аватарка:</label>
         <input type="file" id="chan-file" accept="image/*">
 
-        <button class="btn-primary" onclick="createChannelSubmit()">Создать канал</button>
+        <button class="btn-primary" onclick="createChannelSubmit()">Создать</button>
         <button class="btn-cancel" onclick="document.getElementById('channel-modal').style.display='none'">Отмена</button>
     </div>
 </div>
 
+<!-- Модалка Редактирования Канала -->
+<div id="edit-channel-modal" class="modal-overlay" style="display: none;">
+    <div class="card-modal">
+        <h2>Настройки канала</h2>
+        <p class="subtitle">Изменение информации и аватарки</p>
+        
+        <input type="text" id="edit-chan-name" placeholder="Название канала">
+        <textarea id="edit-chan-desc" rows="2" placeholder="Описание канала..."></textarea>
+        <label style="font-size: 0.8rem; color: var(--text-sub); display: block; margin-bottom: 6px;">Новая аватарка канала:</label>
+        <input type="file" id="edit-chan-file" accept="image/*">
+
+        <button class="btn-primary" onclick="saveChannelEdit()">Сохранить изменения</button>
+        <button class="btn-cancel" onclick="document.getElementById('edit-channel-modal').style.display='none'">Закрыть</button>
+    </div>
+</div>
+
+<!-- Модалка Профиля -->
 <div id="profile-modal" class="modal-overlay" style="display: none;">
     <div class="card-modal" style="text-align: center;">
-        <h2>Мой Cipher ID</h2>
+        <h2>Мой профиль</h2>
         <div id="profile-avatar-preview" style="width: 80px; height: 80px; border-radius: 50%; margin: 15px auto; display:flex; align-items:center; justify-content:center; font-size:2rem; font-weight:bold; color:#fff; overflow:hidden;"></div>
         <div style="display:flex; align-items:center; justify-content:center; gap:8px; margin-bottom:4px;">
-            <h3 id="profile-name"></h3>
+            <h3 id="profile-name" style="color:var(--text-main);"></h3>
             <span id="profile-dev-badge" class="dev-badge" style="display:none;">🛠️ DEV</span>
         </div>
-        <p id="profile-tag" style="color: var(--badge-blue); font-size: 0.9rem; margin-bottom: 15px;"></p>
+        <p id="profile-tag" style="color: var(--badge-blue); font-size: 0.9rem; margin-bottom: 12px;"></p>
         
-        <label style="font-size: 0.85rem; color: var(--text-sub); display: block; margin-bottom: 8px;">Сменить фото:</label>
+        <label style="font-size: 0.8rem; color: var(--text-sub); display: block; text-align:left; margin-bottom:4px;">Личный статус:</label>
+        <select id="user-status-select" onchange="changeMyStatus(this.value)">
+            <option value="online">🟢 В сети</option>
+            <option value="dnd">⛔ Не беспокоить</option>
+            <option value="offline">⚪ Невидимка / Не в сети</option>
+        </select>
+
+        <label style="font-size: 0.8rem; color: var(--text-sub); display: block; text-align:left; margin-bottom:4px;">Сменить аватарку:</label>
         <input type="file" id="profile-file" accept="image/*">
         
         <button class="btn-primary" onclick="uploadUserAvatar()">Сохранить аватарку</button>
-        <button class="btn-cancel" onclick="logout()" style="color: var(--danger-red); margin-top: 8px;">Выйти из Cipher 🚪</button>
+        <button class="btn-cancel" onclick="logout()" style="color: #ef4444; margin-top: 8px;">Выйти из Cipher 🚪</button>
         <button class="btn-cancel" onclick="document.getElementById('profile-modal').style.display='none'">Закрыть</button>
     </div>
 </div>
 
+<!-- Модалка Просмотра Чужого Профиля -->
 <div id="user-info-modal" class="modal-overlay" style="display: none;">
     <div class="card-modal" style="text-align: center;">
         <h2>Профиль пользователя</h2>
         <div id="info-avatar" style="width: 80px; height: 80px; border-radius: 50%; margin: 15px auto; display:flex; align-items:center; justify-content:center; font-size:2rem; font-weight:bold; color:#fff; overflow:hidden;"></div>
         <div style="display:flex; align-items:center; justify-content:center; gap:8px; margin-bottom:4px;">
-            <h3 id="info-name"></h3>
+            <h3 id="info-name" style="color:var(--text-main);"></h3>
             <span id="info-dev-badge" class="dev-badge" style="display:none;">🛠️ DEV</span>
         </div>
         <p id="info-tag" style="color: var(--badge-blue); font-size: 0.9rem; margin-bottom: 6px;"></p>
+        <p id="info-status-text" style="font-size: 0.85rem; color: var(--online-green); margin-bottom: 4px;">🟢 В сети</p>
         <p id="info-date" style="color: var(--text-sub); font-size: 0.8rem; margin-bottom: 16px;">Регистрация: ...</p>
         
         <button class="btn-primary" id="info-block-btn" style="background:#ef4444;" onclick="toggleBlockContact()">🚫 Заблокировать</button>
         <button class="btn-cancel" onclick="document.getElementById('user-info-modal').style.display='none'">Закрыть</button>
+    </div>
+</div>
+
+<!-- Модалка Пересылки Сообщения -->
+<div id="forward-modal" class="modal-overlay" style="display: none;">
+    <div class="card-modal">
+        <h2>Переслать сообщение</h2>
+        <p class="subtitle">Выберите чат для отправки</p>
+        <div id="forward-chats-list" style="max-height:220px; overflow-y:auto; margin-bottom:14px;"></div>
+        <button class="btn-cancel" onclick="document.getElementById('forward-modal').style.display='none'">Отмена</button>
     </div>
 </div>
 
@@ -1240,20 +1366,21 @@ HTML_TEMPLATE = """
                 <div class="avatar-small" id="my-avatar-mini">?</div>
                 <div>
                     <div style="display:flex; align-items:center; gap:6px;">
-                        <span id="my-display-name" style="font-weight:600; font-size:0.92rem;">Загрузка...</span>
+                        <span id="my-display-name" style="font-weight:600; font-size:0.92rem; color:var(--text-main);">Загрузка...</span>
                         <span id="my-dev-badge" class="dev-badge" style="display:none;">DEV</span>
                     </div>
                     <div id="my-tag" style="font-size:0.75rem; color:var(--text-sub);">@...</div>
                 </div>
             </div>
             <div class="sidebar-actions">
-                <button class="icon-btn" title="Создать канал" onclick="document.getElementById('channel-modal').style.display='flex'">➕</button>
+                <button class="icon-btn" title="Сменить тему" onclick="toggleTheme()">🌓</button>
+                <button class="icon-btn" title="Создать канал или группу" onclick="document.getElementById('channel-modal').style.display='flex'">➕</button>
             </div>
         </div>
 
         <div class="search-container">
             <span class="search-icon">🔍</span>
-            <input type="text" class="search-input" id="search-input" placeholder="Поиск @юзеров, каналов, email и сообщений..." oninput="handleSearch(this.value)">
+            <input type="text" class="search-input" id="search-input" placeholder="Поиск @юзеров, каналов, сообщений..." oninput="handleSearch(this.value)">
         </div>
 
         <div class="chat-list" id="chat-list"></div>
@@ -1262,20 +1389,26 @@ HTML_TEMPLATE = """
     <div id="chat-area">
         <div id="chat-placeholder" class="empty-placeholder">
             <div style="font-size: 3rem;">⚡</div>
-            <h3 style="color:#fff;">Добро пожаловать в Cipher</h3>
+            <h3 style="color:var(--text-main);">Добро пожаловать в Cipher</h3>
             <p>Выберите диалог или найдите контакт через поиск 🔍</p>
         </div>
 
         <div id="chat-content" style="display:none; flex-direction:column; height:100%;">
             <div class="chat-header">
-                <button class="back-btn" onclick="document.body.classList.remove('in-chat')">←</button>
-                <div class="avatar-small" id="header-avatar" style="width:42px; height:42px; font-size:1.1rem; margin-right:12px; cursor:pointer;" onclick="openPeerInfo()">?</div>
-                <div style="cursor:pointer;" onclick="openPeerInfo()">
-                    <div style="display:flex; align-items:center; gap:6px;">
-                        <span id="header-title" style="font-weight:600; font-size:1rem;">Выберите чат</span>
-                        <span id="header-dev-badge" class="dev-badge" style="display:none;">DEV</span>
+                <div style="display:flex; align-items:center;">
+                    <button class="back-btn" onclick="document.body.classList.remove('in-chat')">←</button>
+                    <div class="avatar-small" id="header-avatar" style="width:42px; height:42px; font-size:1.1rem; margin-right:12px; cursor:pointer;" onclick="openPeerInfo()">?</div>
+                    <div style="cursor:pointer;" onclick="openPeerInfo()">
+                        <div style="display:flex; align-items:center; gap:6px;">
+                            <span id="header-title" style="font-weight:600; font-size:1rem; color:var(--text-main);">Выберите чат</span>
+                            <span id="header-dev-badge" class="dev-badge" style="display:none;">DEV</span>
+                        </div>
+                        <div id="header-sub" style="font-size:0.78rem; color:var(--badge-blue);">Cipher Network</div>
                     </div>
-                    <div id="header-sub" style="font-size:0.78rem; color:var(--badge-blue);">Cipher Network</div>
+                </div>
+
+                <div style="display:flex; gap:8px;">
+                    <button class="icon-btn" id="channel-settings-btn" title="Настройки канала" style="display:none;" onclick="openChannelSettings()">⚙️</button>
                 </div>
             </div>
 
@@ -1309,6 +1442,7 @@ HTML_TEMPLATE = """
 <script>
     let user = JSON.parse(localStorage.getItem("messenger_user") || "null");
     let currentTarget = localStorage.getItem("messenger_target") || "";
+    let currentTheme = localStorage.getItem("messenger_theme") || "dark";
     let isRegister = false;
     let ws = null;
     let chatsList = [];
@@ -1317,6 +1451,7 @@ HTML_TEMPLATE = """
     let selectedMsg = null;
     let replyMsg = null;
     let editMsg = null;
+    let forwardMsg = null;
     let viewingPeerInfo = null;
 
     let searchQuery = "";
@@ -1328,6 +1463,44 @@ HTML_TEMPLATE = """
     let audioChunks = [];
     let isRecording = false;
     let typingTimeout = null;
+
+    // Инициализация темы
+    document.documentElement.setAttribute("data-theme", currentTheme);
+
+    function toggleTheme() {
+        currentTheme = currentTheme === "dark" ? "light" : "dark";
+        document.documentElement.setAttribute("data-theme", currentTheme);
+        localStorage.setItem("messenger_theme", currentTheme);
+    }
+
+    // Звук нового сообщения через Web Audio API
+    function playNotificationSound() {
+        try {
+            const ctx = new (window.AudioContext || window.webkitAudioContext)();
+            const osc = ctx.createOscillator();
+            const gain = ctx.createGain();
+            osc.type = "sine";
+            osc.frequency.setValueAtTime(587.33, ctx.currentTime); // D5
+            osc.frequency.exponentialRampToValueAtTime(880, ctx.currentTime + 0.1); // A5
+            gain.gain.setValueAtTime(0.2, ctx.currentTime);
+            gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.25);
+            osc.connect(gain);
+            gain.connect(ctx.destination);
+            osc.start();
+            osc.stop(ctx.currentTime + 0.25);
+        } catch(e) {}
+    }
+
+    // Запрос прав на браузерные Push-уведомления
+    if ("Notification" in window && Notification.permission !== "granted" && Notification.permission !== "denied") {
+        Notification.requestPermission();
+    }
+
+    function showBrowserNotification(title, text) {
+        if ("Notification" in window && Notification.permission === "granted" && document.hidden) {
+            new Notification(title, { body: text, icon: "/icon.svg" });
+        }
+    }
 
     const DEV_USERS = ["milesconxxwow", "miles"];
     function checkIsDev(uname) {
@@ -1348,6 +1521,14 @@ HTML_TEMPLATE = """
         return gradients[hash % gradients.length];
     }
 
+    function formatMentionsAndTags(text) {
+        if (!text) return "";
+        let escaped = escapeHtml(text);
+        escaped = escaped.replace(/@([a-zA-Z0-9_]+)/g, '<a class="mention" onclick="openPeerInfo(\\'$1\\')">@$1</a>');
+        escaped = escaped.replace(/#([a-zA-Z0-9_]+)/g, '<a class="mention" onclick="handleSearch(\\'#$1\\')">#$1</a>');
+        return escaped;
+    }
+
     function highlightText(text, query) {
         if (!text) return "";
         if (!query) return escapeHtml(text);
@@ -1359,9 +1540,7 @@ HTML_TEMPLATE = """
 
     String.prototype.lstrip = function (chars) {
         let start = 0;
-        while (start < this.length && chars.indexOf(this[start]) >= 0) {
-            start++;
-        }
+        while (start < this.length && chars.indexOf(this[start]) >= 0) start++;
         return this.substring(start);
     };
 
@@ -1468,14 +1647,28 @@ HTML_TEMPLATE = """
                 document.getElementById("header-sub").innerText = "печатает...";
                 clearTimeout(typingTimeout);
                 typingTimeout = setTimeout(() => {
-                    document.getElementById("header-sub").innerText = currentTarget.startsWith("#") ? "Канал" : "@" + currentTarget;
+                    updateHeaderSubtitle();
                 }, 2000);
             } else if (data.type === "msg") {
                 const isGroup = data.target.startsWith("#");
                 const chatKey = isGroup ? data.target : data.sender_username;
                 
+                if (data.sender_username !== user.username) {
+                    playNotificationSound();
+                    showBrowserNotification(data.sender_name, data.text || "Медиафайл");
+                }
+
                 if (currentTarget === chatKey || (isGroup && currentTarget === data.target) || (data.sender_username === user.username && data.target === currentTarget)) {
                     currentMessages.push(data);
+                    renderAllMessages();
+                    if (data.sender_username !== user.username && !isGroup) {
+                        ws.send(JSON.stringify({ action: "read", target: data.sender_username }));
+                    }
+                }
+                fetchUserChats();
+            } else if (data.type === "read_receipt") {
+                if (currentTarget === data.reader) {
+                    currentMessages.forEach(m => { if (m.sender_username === user.username) m.is_read = true; });
                     renderAllMessages();
                 }
                 fetchUserChats();
@@ -1495,12 +1688,28 @@ HTML_TEMPLATE = """
         document.getElementById("profile-tag").innerText = "@" + user.username;
         renderAvatarEl(document.getElementById("profile-avatar-preview"), user.display_name, user.avatar_url);
         if (checkIsDev(user.username)) document.getElementById("profile-dev-badge").style.display = "inline-flex";
+        document.getElementById("user-status-select").value = user.custom_status || "online";
         document.getElementById("profile-modal").style.display = "flex";
+    }
+
+    async function changeMyStatus(st) {
+        user.custom_status = st;
+        localStorage.setItem("messenger_user", JSON.stringify(user));
+        await fetch("/api/update_status", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({ username: user.username, status: st })
+        });
     }
 
     async function openPeerInfo(targetUsername = null) {
         const target = targetUsername || currentTarget;
-        if (!target || target.startsWith("#")) return;
+        if (!target) return;
+
+        if (target.startsWith("#")) {
+            openChannelSettings();
+            return;
+        }
 
         const res = await fetch(`/api/user_info?username=${encodeURIComponent(target)}&current_user=${encodeURIComponent(user.username)}`);
         const data = await res.json();
@@ -1511,6 +1720,19 @@ HTML_TEMPLATE = """
             document.getElementById("info-date").innerText = "Регистрация: " + data.created_at;
             renderAvatarEl(document.getElementById("info-avatar"), data.display_name, data.avatar_url);
             
+            const isOnline = onlineUsers.includes(data.username);
+            const stEl = document.getElementById("info-status-text");
+            if (data.custom_status === "dnd") {
+                stEl.innerText = "⛔ Не беспокоить";
+                stEl.style.color = "#ef4444";
+            } else if (isOnline && data.custom_status !== "offline") {
+                stEl.innerText = "🟢 В сети";
+                stEl.style.color = "var(--online-green)";
+            } else {
+                stEl.innerText = data.last_seen ? `Был(а) в сети в ${data.last_seen}` : "Был(а) недавно";
+                stEl.style.color = "var(--text-sub)";
+            }
+
             document.getElementById("info-dev-badge").style.display = data.is_dev ? "inline-flex" : "none";
             const btn = document.getElementById("info-block-btn");
             btn.innerText = data.is_blocked ? "Разблокировать" : "🚫 Заблокировать";
@@ -1518,6 +1740,35 @@ HTML_TEMPLATE = """
 
             document.getElementById("user-info-modal").style.display = "flex";
         }
+    }
+
+    function openChannelSettings() {
+        const chat = chatsList.find(c => c.key === currentTarget);
+        if (!chat) return;
+        document.getElementById("edit-chan-name").value = chat.name;
+        document.getElementById("edit-chan-desc").value = chat.desc || "";
+        document.getElementById("edit-channel-modal").style.display = "flex";
+    }
+
+    async function saveChannelEdit() {
+        const name = document.getElementById("edit-chan-name").value;
+        const desc = document.getElementById("edit-chan-desc").value;
+        const file = document.getElementById("edit-chan-file").files[0];
+
+        const form = new FormData();
+        form.append("tag", currentTarget.replace("#", ""));
+        form.append("name", name);
+        form.append("desc", desc);
+        form.append("requester", user.username);
+        if (file) form.append("file", file);
+
+        const res = await fetch("/api/update_channel", { method: "POST", body: form });
+        const data = await res.json();
+        if (data.status === "ok") {
+            document.getElementById("edit-channel-modal").style.display = "none";
+            await fetchUserChats();
+            selectChat(currentTarget);
+        } else alert(data.message);
     }
 
     async function toggleBlockContact() {
@@ -1555,12 +1806,14 @@ HTML_TEMPLATE = """
     }
 
     async function createChannelSubmit() {
+        const isGroup = document.getElementById("chan-type-select").value;
         const name = document.getElementById("chan-name").value;
         const tag = document.getElementById("chan-tag").value;
         const desc = document.getElementById("chan-desc").value;
         const fileInput = document.getElementById("chan-file");
 
         const form = new FormData();
+        form.append("is_group", isGroup);
         form.append("name", name);
         form.append("tag", tag);
         form.append("desc", desc);
@@ -1605,11 +1858,6 @@ HTML_TEMPLATE = """
         renderSearchResults();
     }
 
-    function loadMoreSearch() {
-        searchOffset += 12;
-        fetchSearchResults(true);
-    }
-
     function renderSearchResults() {
         const list = document.getElementById("chat-list");
         list.innerHTML = `<div style="padding:10px 18px; font-size:0.75rem; color:var(--text-sub); display:flex; justify-content:space-between;">
@@ -1647,7 +1895,7 @@ HTML_TEMPLATE = """
             };
 
             const isMsg = item.type === "message";
-            const iconBadge = isMsg ? "💬 " : (item.type === "channel" ? "📢 " : "");
+            const iconBadge = isMsg ? "💬 " : (item.type === "group" ? "👥 " : (item.type === "channel" ? "📢 " : ""));
 
             div.innerHTML = `
                 <div class="avatar-wrap">
@@ -1664,14 +1912,6 @@ HTML_TEMPLATE = """
             `;
             list.appendChild(div);
         });
-
-        if (searchHasMore) {
-            const loadMore = document.createElement("div");
-            loadMore.className = "load-more-btn";
-            loadMore.innerText = "⬇️ Показать ещё результаты";
-            loadMore.onclick = loadMoreSearch;
-            list.appendChild(loadMore);
-        }
     }
 
     function renderSidebar() {
@@ -1686,14 +1926,22 @@ HTML_TEMPLATE = """
         chatsList.forEach(chat => {
             const isOnline = onlineUsers.includes(chat.key);
             const isPeerDev = checkIsDev(chat.key);
+            const isDnd = chat.custom_status === "dnd";
+            const isInv = chat.custom_status === "offline";
+
             const div = document.createElement("div");
             div.className = `chat-item ${currentTarget === chat.key ? 'active' : ''}`;
             div.onclick = () => selectChat(chat.key);
 
+            let checkIcon = "";
+            if (chat.last_sender === user.username) {
+                checkIcon = chat.last_read ? '<span class="read-status">✓✓ </span>' : '<span style="opacity:0.6;">✓ </span>';
+            }
+
             div.innerHTML = `
                 <div class="avatar-wrap">
                     <div class="avatar-img" style="background:${getGradient(chat.name)}">${chat.avatar ? `<img src="${chat.avatar}" style="width:100%;height:100%;border-radius:50%;object-fit:cover;">` : chat.name[0].toUpperCase()}</div>
-                    <div class="online-dot ${isOnline ? 'visible' : ''}"></div>
+                    <div class="online-dot ${isDnd ? 'dnd' : (isOnline && !isInv ? 'visible' : '')}"></div>
                 </div>
                 <div class="chat-details">
                     <div class="chat-top-row">
@@ -1705,12 +1953,33 @@ HTML_TEMPLATE = """
                         <div class="chat-time">${chat.time || ''}</div>
                     </div>
                     <div class="chat-bottom-row">
-                        <div class="chat-preview">${chat.last_msg || (chat.key.startsWith('#') ? 'Канал' : 'Диалог')}</div>
+                        <div class="chat-preview">${checkIcon}${chat.last_msg || (chat.type === 'group' ? 'Группа' : (chat.key.startsWith('#') ? 'Канал' : 'Диалог'))}</div>
                     </div>
                 </div>
             `;
             list.appendChild(div);
         });
+    }
+
+    function updateHeaderSubtitle() {
+        const sub = document.getElementById("header-sub");
+        if (currentTarget.startsWith("#")) {
+            const chat = chatsList.find(c => c.key === currentTarget);
+            sub.innerText = chat ? (chat.type === 'group' ? 'Групповая беседа' : 'Канал') : 'Канал';
+            return;
+        }
+        const isOnline = onlineUsers.includes(currentTarget);
+        const chat = chatsList.find(c => c.key === currentTarget);
+        if (chat && chat.custom_status === "dnd") {
+            sub.innerText = "⛔ Не беспокоить";
+            sub.style.color = "#ef4444";
+        } else if (isOnline && (!chat || chat.custom_status !== "offline")) {
+            sub.innerText = "в сети";
+            sub.style.color = "var(--online-green)";
+        } else {
+            sub.innerText = chat && chat.last_seen ? `был(а) в ${chat.last_seen}` : "был(а) недавно";
+            sub.style.color = "var(--text-sub)";
+        }
     }
 
     async function selectChat(key) {
@@ -1723,17 +1992,21 @@ HTML_TEMPLATE = """
         
         let chat = chatsList.find(c => c.key === key);
         const name = chat ? chat.name : key;
-        const tag = chat ? chat.tag : key;
         const avatar = chat ? chat.avatar : "";
         const isPeerDev = checkIsDev(key);
 
         document.getElementById("header-title").innerText = name;
-        document.getElementById("header-sub").innerText = key.startsWith("#") ? "Канал" : tag;
         document.getElementById("header-dev-badge").style.display = isPeerDev ? "inline-flex" : "none";
+        document.getElementById("channel-settings-btn").style.display = key.startsWith("#") ? "flex" : "none";
         renderAvatarEl(document.getElementById("header-avatar"), name, avatar);
 
+        updateHeaderSubtitle();
         document.body.classList.add("in-chat");
         if (!document.getElementById("search-input").value.trim()) renderSidebar();
+        
+        if (ws && !key.startsWith("#")) {
+            ws.send(JSON.stringify({ action: "read", target: key }));
+        }
         await loadHistory();
     }
 
@@ -1753,6 +2026,9 @@ HTML_TEMPLATE = """
             row.className = `msg-row ${isMine ? 'mine' : 'theirs'}`;
 
             let contentHtml = "";
+            if (m.forward_from) {
+                contentHtml += `<div class="bubble-fwd">↪️ Переслано от @${escapeHtml(m.forward_from)}</div>`;
+            }
             if (m.reply_to_text) {
                 contentHtml += `<div class="bubble-reply"><span class="reply-user">@${escapeHtml(m.reply_to_sender)}</span>: ${escapeHtml(m.reply_to_text)}</div>`;
             }
@@ -1760,31 +2036,33 @@ HTML_TEMPLATE = """
             if (m.msg_type === "image") {
                 contentHtml += `<img src="${m.file_url}" class="bubble-img" onclick="window.open('${m.file_url}', '_blank')">`;
             } else if (m.msg_type === "video") {
-                contentHtml += `
-                    <video controls src="${m.file_url}" class="bubble-video"></video>`;
+                contentHtml += `<video controls src="${m.file_url}" class="bubble-video"></video>`;
             } else if (m.msg_type === "voice") {
-                contentHtml += `
-                    <div class="audio-player">
-                        <audio controls src="${m.file_url}"></audio>
-                    </div>`;
+                contentHtml += `<div class="audio-player"><audio controls src="${m.file_url}"></audio></div>`;
             } else if (m.msg_type === "document") {
                 contentHtml += `<a href="${m.file_url}" download="${m.file_name}" class="file-attachment">📄 ${escapeHtml(m.file_name || 'Скачать файл')}</a>`;
             }
 
             if (m.text) {
-                contentHtml += `<div>${escapeHtml(m.text)}</div>`;
+                contentHtml += `<div>${formatMentionsAndTags(m.text)}</div>`;
             }
 
             let reactionsHtml = "";
             if (m.reactions && Object.keys(m.reactions).length > 0) {
                 reactionsHtml = `<div class="reactions-row">`;
-                for (const [emo, count] of Object.entries(m.reactions)) {
-                    reactionsHtml += `<div class="reaction-chip" onclick="event.stopPropagation(); toggleReaction(${m.id}, '${emo}')">${emo} ${count}</div>`;
+                for (const [emo, data] of Object.entries(m.reactions)) {
+                    const count = typeof data === 'object' ? data.count : data;
+                    const usersList = typeof data === 'object' && data.users ? data.users.join(', ') : '';
+                    reactionsHtml += `<div class="reaction-chip" title="Поставили: ${usersList}" onclick="event.stopPropagation(); toggleReaction(${m.id}, '${emo}')">${emo} ${count}</div>`;
                 }
                 reactionsHtml += `</div>`;
             }
 
             const isMsgDev = checkIsDev(m.sender_username);
+            let checkIcon = "";
+            if (isMine && !currentTarget.startsWith("#")) {
+                checkIcon = m.is_read ? '<span class="read-status">✓✓</span>' : '<span style="opacity:0.6;">✓</span>';
+            }
 
             row.innerHTML = `
                 ${!isMine && m.avatar ? `<img src="${m.avatar}" class="msg-avatar" onclick="openPeerInfo('${m.sender_username}')">` : ''}
@@ -1800,6 +2078,7 @@ HTML_TEMPLATE = """
                     <div class="bubble-footer">
                         ${m.is_edited ? '<span style="font-size:0.65rem; opacity:0.6;">(изм.)</span>' : ''}
                         <span class="bubble-time">${m.time}</span>
+                        ${checkIcon}
                     </div>
                 </div>
             `;
@@ -1813,8 +2092,8 @@ HTML_TEMPLATE = """
         if (!selectedMsg) return;
 
         const menu = document.getElementById("msg-menu");
-        menu.style.left = `${Math.min(e.clientX, window.innerWidth - 180)}px`;
-        menu.style.top = `${Math.min(e.clientY, window.innerHeight - 200)}px`;
+        menu.style.left = `${Math.min(e.clientX, window.innerWidth - 190)}px`;
+        menu.style.top = `${Math.min(e.clientY, window.innerHeight - 220)}px`;
         menu.style.display = "flex";
 
         document.getElementById("menu-edit-btn").style.display = isMine && selectedMsg.msg_type === "text" ? "flex" : "none";
@@ -1846,15 +2125,59 @@ HTML_TEMPLATE = """
     function startReply() {
         replyMsg = selectedMsg;
         editMsg = null;
+        forwardMsg = null;
         document.getElementById("action-title").innerText = `Ответ пользователю @${replyMsg.sender_username}`;
-        document.getElementById("action-text").innerText = replyMsg.text || (replyMsg.msg_type === 'image' ? '📷 Фото' : (replyMsg.msg_type === 'video' ? '🎬 Видео' : '🎙️ Голосовое'));
+        document.getElementById("action-text").innerText = replyMsg.text || (replyMsg.msg_type === 'image' ? '📷 Фото' : '🎙️ Голосовое');
         document.getElementById("action-banner").style.display = "flex";
         document.getElementById("msg-input").focus();
+    }
+
+    function startForward() {
+        forwardMsg = selectedMsg;
+        const box = document.getElementById("forward-chats-list");
+        box.innerHTML = "";
+        chatsList.forEach(c => {
+            const div = document.createElement("div");
+            div.className = "chat-item";
+            div.style.padding = "8px 10px";
+            div.style.borderRadius = "8px";
+            div.onclick = () => sendForwardTo(c.key);
+            div.innerHTML = `
+                <div class="avatar-wrap" style="margin-right:10px;">
+                    <div class="avatar-img" style="width:36px; height:36px;">${c.name[0].toUpperCase()}</div>
+                </div>
+                <div><b>${c.name}</b> <span style="font-size:0.75rem; color:var(--badge-blue);">${c.tag}</span></div>
+            `;
+            box.appendChild(div);
+        });
+        document.getElementById("forward-modal").style.display = "flex";
+    }
+
+    function sendForwardTo(targetKey) {
+        if (!forwardMsg || !ws) return;
+        const timeStr = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        const payload = {
+            action: "send",
+            sender_username: user.username,
+            sender_name: user.display_name,
+            target: targetKey,
+            text: forwardMsg.text,
+            msg_type: forwardMsg.msg_type,
+            file_url: forwardMsg.file_url,
+            file_name: forwardMsg.file_name,
+            forward_from: forwardMsg.sender_username,
+            avatar: user.avatar_url || "",
+            time: timeStr
+        };
+        ws.send(JSON.stringify(payload));
+        document.getElementById("forward-modal").style.display = "none";
+        selectChat(targetKey);
     }
 
     function startEdit() {
         editMsg = selectedMsg;
         replyMsg = null;
+        forwardMsg = null;
         document.getElementById("action-title").innerText = "Редактирование сообщения";
         document.getElementById("action-text").innerText = editMsg.text;
         document.getElementById("action-banner").style.display = "flex";
@@ -1865,6 +2188,7 @@ HTML_TEMPLATE = """
     function cancelAction() {
         replyMsg = null;
         editMsg = null;
+        forwardMsg = null;
         document.getElementById("action-banner").style.display = "none";
         document.getElementById("msg-input").value = "";
     }
@@ -1947,7 +2271,7 @@ HTML_TEMPLATE = """
                 mediaRecorder.start();
                 isRecording = true;
                 btn.classList.add("recording");
-                btn.title = "Нажмите, чтобы отправить голосовое";
+                btn.title = "Нажмите для отправки";
             } catch (err) {
                 alert("Нет доступа к микрофону");
             }
@@ -2024,6 +2348,14 @@ async def ws_endpoint(websocket: WebSocket, username: str):
                 await manager.send_to_user({"type": "typing", "sender": username}, target)
                 continue
 
+            elif action == "read":
+                # Собеседник прочитал сообщения
+                async with aiosqlite.connect(DB_PATH) as db:
+                    await db.execute("UPDATE messages SET is_read = 1 WHERE sender_username = ? AND target = ?", (target, username))
+                    await db.commit()
+                await manager.send_to_user({"type": "read_receipt", "reader": username}, target)
+                continue
+
             elif action == "reaction":
                 msg_id = data.get("msg_id")
                 emoji = data.get("emoji")
@@ -2032,13 +2364,27 @@ async def ws_endpoint(websocket: WebSocket, username: str):
                     row = await cur.fetchone()
                     if row:
                         reacts = json.loads(row[0] or "{}")
-                        reacts[emoji] = reacts.get(emoji, 0) + 1
+                        if emoji not in reacts:
+                            reacts[emoji] = {"count": 1, "users": [username]}
+                        else:
+                            if isinstance(reacts[emoji], int):
+                                reacts[emoji] = {"count": reacts[emoji] + 1, "users": [username]}
+                            else:
+                                if username in reacts[emoji]["users"]:
+                                    reacts[emoji]["users"].remove(username)
+                                    reacts[emoji]["count"] = max(0, reacts[emoji]["count"] - 1)
+                                    if reacts[emoji]["count"] == 0:
+                                        del reacts[emoji]
+                                else:
+                                    reacts[emoji]["users"].append(username)
+                                    reacts[emoji]["count"] += 1
+
                         await db.execute("UPDATE messages SET reactions = ? WHERE id = ?", (json.dumps(reacts), msg_id))
                         await db.commit()
                 
                 payload = {"type": "reaction", "msg_id": msg_id, "target": target}
                 if target.startswith("#"):
-                    await manager.broadcast(payload)
+                    await manager.broadcast_channel(payload)
                 else:
                     await manager.send_to_user(payload, target)
                     await manager.send_to_user(payload, username)
@@ -2053,7 +2399,7 @@ async def ws_endpoint(websocket: WebSocket, username: str):
                 
                 payload = {"type": "edit_msg", "msg_id": msg_id, "text": new_text, "target": target}
                 if target.startswith("#"):
-                    await manager.broadcast(payload)
+                    await manager.broadcast_channel(payload)
                 else:
                     await manager.send_to_user(payload, target)
                     await manager.send_to_user(payload, username)
@@ -2067,13 +2413,13 @@ async def ws_endpoint(websocket: WebSocket, username: str):
                 
                 payload = {"type": "delete_msg", "msg_id": msg_id, "target": target}
                 if target.startswith("#"):
-                    await manager.broadcast(payload)
+                    await manager.broadcast_channel(payload)
                 else:
                     await manager.send_to_user(payload, target)
                     await manager.send_to_user(payload, username)
                 continue
 
-            # Отправка сообщения
+            # Отправка нового сообщения
             text = data.get("text", "")
             msg_type = data.get("msg_type", "text")
             file_url = data.get("file_url", "")
@@ -2081,15 +2427,16 @@ async def ws_endpoint(websocket: WebSocket, username: str):
             reply_id = data.get("reply_to_id", 0)
             reply_text = data.get("reply_to_text", "")
             reply_sender = data.get("reply_to_sender", "")
+            forward_from = data.get("forward_from", "")
             time_str = datetime.now().strftime("%H:%M")
 
             async with aiosqlite.connect(DB_PATH) as db:
                 cur = await db.execute(
                     """INSERT INTO messages (sender_username, sender_name, target, text, msg_type, file_url, file_name, 
-                                             reply_to_id, reply_to_text, reply_to_sender, timestamp, avatar_url) 
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                             reply_to_id, reply_to_text, reply_to_sender, forward_from, timestamp, avatar_url) 
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (username, data.get("sender_name", username), target, text, msg_type, file_url, file_name, 
-                     reply_id, reply_text, reply_sender, time_str, data.get("avatar", ""))
+                     reply_id, reply_text, reply_sender, forward_from, time_str, data.get("avatar", ""))
                 )
                 await db.commit()
                 msg_id = cur.lastrowid
@@ -2107,7 +2454,9 @@ async def ws_endpoint(websocket: WebSocket, username: str):
                 "reply_to_id": reply_id,
                 "reply_to_text": reply_text,
                 "reply_to_sender": reply_sender,
+                "forward_from": forward_from,
                 "reactions": {},
+                "is_read": False,
                 "is_edited": False,
                 "time": time_str,
                 "avatar": data.get("avatar", ""),
@@ -2115,8 +2464,7 @@ async def ws_endpoint(websocket: WebSocket, username: str):
             }
 
             if target.startswith("#"):
-                await manager.broadcast(msg_out)
-                await manager.send_to_user(msg_out, recipient_username=username)
+                await manager.broadcast_channel(msg_out)
             else:
                 async with aiosqlite.connect(DB_PATH) as db:
                     cur_block = await db.execute("SELECT id FROM blocks WHERE blocker = ? AND blocked = ?", (target, username))
