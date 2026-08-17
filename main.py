@@ -7,7 +7,7 @@ import aiosqlite
 import re
 from datetime import datetime
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -115,8 +115,7 @@ async def init_db():
                 UNIQUE(blocker, blocked)
             )
         """)
-        
-        # Автоматическая миграция (добавление колонок, если база старая)
+
         migrations = [
             ("users", "custom_status", "TEXT DEFAULT 'online'"),
             ("users", "last_seen", "TEXT DEFAULT ''"),
@@ -212,16 +211,24 @@ async def register(data: RegisterModel):
     pwd = data.password.strip()
 
     if not email or not uname or not pwd:
-        return {"status": "error", "message": "Заполните все поля"}
+        return {"status": "error", "message": "Заполните все обязательные поля"}
+    
+    if not re.match(r"^[a-zA-Z0-9_]+$", uname):
+        return {"status": "error", "message": "Юзернейм может содержать только латинские буквы, цифры и _"}
+
     if len(uname) < 3:
-        return {"status": "error", "message": "Юзернейм от 3 символов"}
+        return {"status": "error", "message": "Юзернейм должен быть не короче 3 символов"}
     if len(pwd) < 4:
-        return {"status": "error", "message": "Пароль от 4 символов"}
+        return {"status": "error", "message": "Пароль должен быть от 4 символов"}
 
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT id FROM users WHERE email = ? OR username = ?", (email, uname))
-        if await cur.fetchone():
-            return {"status": "error", "message": "Email или юзернейм уже заняты"}
+        cur_u = await db.execute("SELECT id FROM users WHERE username = ?", (uname,))
+        if await cur_u.fetchone():
+            return {"status": "error", "message": f"Юзернейм @{uname} уже занят другим пользователем"}
+
+        cur_e = await db.execute("SELECT id FROM users WHERE email = ?", (email,))
+        if await cur_e.fetchone():
+            return {"status": "error", "message": "Этот Email уже зарегистрирован"}
 
         pwd_hash = hash_password(pwd)
         created_at = datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -733,6 +740,18 @@ HTML_TEMPLATE = """
             font-size: 0.95rem;
         }
         .card-modal input:focus { border-color: var(--badge-blue); }
+
+        .auth-error {
+            background: rgba(239, 68, 68, 0.15);
+            border: 1px solid #ef4444;
+            color: #ef4444;
+            padding: 10px;
+            border-radius: 10px;
+            font-size: 0.85rem;
+            margin-bottom: 12px;
+            display: none;
+            text-align: center;
+        }
         
         .btn-primary {
             width: 100%;
@@ -1259,6 +1278,8 @@ HTML_TEMPLATE = """
         <div class="brand-logo">⚡ CIPHER<span>.</span></div>
         <p class="subtitle" id="auth-sub">Secure Cloud Network</p>
         
+        <div id="auth-error-box" class="auth-error"></div>
+
         <input type="text" id="auth-login" placeholder="Email или @юзернейм">
         <input type="text" id="auth-name" placeholder="Отображаемое имя (например, Miles)" style="display:none;">
         <input type="text" id="auth-username" placeholder="Уникальный @юзернейм" style="display:none;">
@@ -1561,9 +1582,17 @@ HTML_TEMPLATE = """
         document.getElementById("auth-username").style.display = isRegister ? "block" : "none";
         document.getElementById("auth-btn").innerText = isRegister ? "Зарегистрироваться в Cipher" : "Войти в Cipher";
         document.getElementById("auth-toggle").innerText = isRegister ? "Уже есть аккаунт? Войти" : "Нет аккаунта? Создать аккаунт";
+        document.getElementById("auth-error-box").style.display = "none";
+    }
+
+    function showAuthError(msg) {
+        const box = document.getElementById("auth-error-box");
+        box.innerText = msg;
+        box.style.display = "block";
     }
 
     async function submitAuth() {
+        document.getElementById("auth-error-box").style.display = "none";
         if (isRegister) {
             const email = document.getElementById("auth-login").value;
             const display_name = document.getElementById("auth-name").value;
@@ -1580,7 +1609,9 @@ HTML_TEMPLATE = """
                 user = data;
                 localStorage.setItem("messenger_user", JSON.stringify(user));
                 location.reload();
-            } else alert(data.message);
+            } else {
+                showAuthError(data.message);
+            }
         } else {
             const login = document.getElementById("auth-login").value;
             const password = document.getElementById("auth-pwd").value;
@@ -1595,7 +1626,9 @@ HTML_TEMPLATE = """
                 user = data;
                 localStorage.setItem("messenger_user", JSON.stringify(user));
                 location.reload();
-            } else alert(data.message);
+            } else {
+                showAuthError(data.message);
+            }
         }
     }
 
@@ -2488,3 +2521,4 @@ async def ws_endpoint(websocket: WebSocket, username: str):
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=80)
+    
