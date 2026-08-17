@@ -4,8 +4,9 @@ import shutil
 import uuid
 import hashlib
 import aiosqlite
+import re
 from datetime import datetime
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -34,6 +35,28 @@ def is_dev(username: str) -> bool:
 
 def hash_password(password: str) -> str:
     return hashlib.sha256(password.encode("utf-8")).hexdigest()
+
+def normalize_text(text: str) -> str:
+    if not text:
+        return ""
+    text = text.lower()
+    return re.sub(r"[@#\-_.,!?/\\]+", "", text).strip()
+
+def calculate_score(query: str, target: str) -> int:
+    if not query or not target:
+        return 0
+    q = query.lower().strip()
+    t = target.lower().strip()
+    if q == t:
+        return 100
+    if t.startswith(q):
+        return 80
+    if q in t:
+        return 50
+    # Проверка совпадения без спецсимволов
+    if normalize_text(q) in normalize_text(t):
+        return 30
+    return 0
 
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
@@ -403,40 +426,89 @@ async def get_user_chats(username: str):
 
         return {"chats": chats}
 
+# 🚀 УЛУЧШЕННЫЙ ПОИСК С РАНЖИРОВАНИЕМ, СООБЩЕНИЯМИ И EMAIL
 @app.get("/api/search")
-async def search(q: str):
-    search_term = q.strip().lstrip('@').lstrip('#').lower()
-    if not search_term:
-        return {"results": []}
+async def search(q: str, current_user: str = "", offset: int = 0, limit: int = 15):
+    raw_query = q.strip()
+    clean_q = raw_query.lstrip('@').lstrip('#').lower()
+    if not clean_q:
+        return {"results": [], "has_more": False}
 
     results = []
     async with aiosqlite.connect(DB_PATH) as db:
-        cur_u = await db.execute("SELECT username, display_name, avatar_url FROM users")
+        # 1. Поиск по пользователям (Username, Имя, Email)
+        cur_u = await db.execute("SELECT username, display_name, email, avatar_url FROM users")
         for r in await cur_u.fetchall():
-            if search_term in r[0].lower() or search_term in r[1].lower():
+            uname, dname, email, avatar = r[0], r[1], r[2], r[3]
+            s1 = calculate_score(clean_q, uname)
+            s2 = calculate_score(clean_q, dname)
+            s3 = calculate_score(clean_q, email)
+            final_score = max(s1, s2, s3)
+            
+            if final_score > 0:
                 results.append({
+                    "score": final_score,
                     "type": "user",
-                    "key": r[0],
-                    "tag": f"@{r[0]}",
-                    "name": r[1],
-                    "avatar": r[2] or "",
-                    "is_dev": is_dev(r[0])
+                    "key": uname,
+                    "tag": f"@{uname}",
+                    "name": dname,
+                    "extra": email,
+                    "avatar": avatar or "",
+                    "is_dev": is_dev(uname)
                 })
 
+        # 2. Поиск по каналам (Тег, Название, Описание)
         cur_c = await db.execute("SELECT channel_tag, name, avatar_url, description FROM channels")
         for r in await cur_c.fetchall():
-            if search_term in r[0].lower() or search_term in r[1].lower() or search_term in (r[3] or "").lower():
+            tag, name, avatar, desc = r[0], r[1], r[2], r[3] or ""
+            s1 = calculate_score(clean_q, tag)
+            s2 = calculate_score(clean_q, name)
+            s3 = calculate_score(clean_q, desc) // 2
+            final_score = max(s1, s2, s3)
+
+            if final_score > 0:
                 results.append({
+                    "score": final_score,
                     "type": "channel",
-                    "key": f"#{r[0]}",
-                    "tag": f"#{r[0]}",
-                    "name": r[1],
-                    "avatar": r[2] or "",
-                    "desc": r[3] or "Канал",
+                    "key": f"#{tag}",
+                    "tag": f"#{tag}",
+                    "name": name,
+                    "extra": desc or "Канал",
+                    "avatar": avatar or "",
                     "is_dev": False
                 })
 
-    return {"results": results[:20]}
+        # 3. Поиск по сообщениям
+        if current_user:
+            cur_m = await db.execute("""
+                SELECT id, sender_username, sender_name, target, text, timestamp 
+                FROM messages 
+                WHERE is_deleted = 0 
+                  AND msg_type = 'text' 
+                  AND (sender_username = ? OR target = ? OR target LIKE '#%')
+                ORDER BY id DESC LIMIT 200
+            """, (current_user, current_user))
+            for m in await cur_m.fetchall():
+                mid, s_user, s_name, target, text, m_time = m[0], m[1], m[2], m[3], m[4], m[5]
+                if clean_q in text.lower():
+                    dialog_key = target if target.startswith("#") else (s_user if s_user != current_user else target)
+                    results.append({
+                        "score": 35,
+                        "type": "message",
+                        "key": dialog_key,
+                        "tag": f"В чате {dialog_key}",
+                        "name": f"{s_name}: {text}",
+                        "extra": m_time,
+                        "avatar": "",
+                        "is_dev": False
+                    })
+
+    # Сортировка по очкам релевантности (ранжирование)
+    results.sort(key=lambda x: x["score"], reverse=True)
+    paged_results = results[offset : offset + limit]
+    has_more = (offset + limit) < len(results)
+
+    return {"results": paged_results, "has_more": has_more, "total": len(results)}
 
 @app.get("/api/history")
 async def get_history(user: str, target: str):
@@ -530,6 +602,13 @@ HTML_TEMPLATE = """
             align-items: center;
             box-shadow: 0 0 10px rgba(236, 72, 153, 0.35);
             text-transform: uppercase;
+        }
+
+        mark.hl {
+            background: rgba(234, 179, 8, 0.35);
+            color: #fef08a;
+            border-radius: 3px;
+            padding: 0 2px;
         }
 
         .modal-overlay {
@@ -1009,6 +1088,20 @@ HTML_TEMPLATE = """
             justify-content: center;
         }
 
+        .load-more-btn {
+            background: #181c26;
+            color: var(--badge-blue);
+            border: 1px solid #232738;
+            padding: 10px;
+            border-radius: 10px;
+            margin: 12px 18px;
+            font-weight: 600;
+            font-size: 0.85rem;
+            cursor: pointer;
+            text-align: center;
+        }
+        .load-more-btn:hover { background: #22283a; }
+
         .msg-menu {
             position: fixed;
             background: #181c28;
@@ -1160,7 +1253,7 @@ HTML_TEMPLATE = """
 
         <div class="search-container">
             <span class="search-icon">🔍</span>
-            <input type="text" class="search-input" id="search-input" placeholder="Поиск @юзеров и #каналов..." oninput="handleSearch(this.value)">
+            <input type="text" class="search-input" id="search-input" placeholder="Поиск @юзеров, каналов, email и сообщений..." oninput="handleSearch(this.value)">
         </div>
 
         <div class="chat-list" id="chat-list"></div>
@@ -1226,6 +1319,11 @@ HTML_TEMPLATE = """
     let editMsg = null;
     let viewingPeerInfo = null;
 
+    let searchQuery = "";
+    let searchOffset = 0;
+    let searchResultsList = [];
+    let searchHasMore = false;
+
     let mediaRecorder = null;
     let audioChunks = [];
     let isRecording = false;
@@ -1249,6 +1347,23 @@ HTML_TEMPLATE = """
         for (let i = 0; i < (str || "user").length; i++) hash += str.charCodeAt(i);
         return gradients[hash % gradients.length];
     }
+
+    function highlightText(text, query) {
+        if (!text) return "";
+        if (!query) return escapeHtml(text);
+        const cleanQ = query.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&').lstrip('@').lstrip('#');
+        if (!cleanQ) return escapeHtml(text);
+        const regex = new RegExp(`(${cleanQ})`, "gi");
+        return escapeHtml(text).replace(regex, `<mark class="hl">$1</mark>`);
+    }
+
+    String.prototype.lstrip = function (chars) {
+        let start = 0;
+        while (start < this.length && chars.indexOf(this[start]) >= 0) {
+            start++;
+        }
+        return this.substring(start);
+    };
 
     function renderAvatarEl(el, name, avatarUrl) {
         if (avatarUrl) {
@@ -1325,7 +1440,9 @@ HTML_TEMPLATE = """
             const res = await fetch(`/api/chats?username=${encodeURIComponent(user.username)}`);
             const data = await res.json();
             chatsList = data.chats || [];
-            renderSidebar();
+            if (!document.getElementById("search-input").value.trim()) {
+                renderSidebar();
+            }
         } catch(e) {}
     }
 
@@ -1346,7 +1463,7 @@ HTML_TEMPLATE = """
             const data = JSON.parse(e.data);
             if (data.type === "online_list") {
                 onlineUsers = data.users;
-                renderSidebar();
+                if (!document.getElementById("search-input").value.trim()) renderSidebar();
             } else if (data.type === "typing" && data.sender === currentTarget) {
                 document.getElementById("header-sub").innerText = "печатает...";
                 clearTimeout(typingTimeout);
@@ -1462,39 +1579,64 @@ HTML_TEMPLATE = """
     let searchTimeout = null;
     function handleSearch(val) {
         clearTimeout(searchTimeout);
-        const query = val.trim();
-        if (!query) {
+        searchQuery = val.trim();
+        searchOffset = 0;
+        searchResultsList = [];
+
+        if (!searchQuery) {
             renderSidebar();
             return;
         }
         searchTimeout = setTimeout(async () => {
-            const res = await fetch(`/api/search?q=${encodeURIComponent(query)}`);
-            const data = await res.json();
-            renderSearchResults(data.results || []);
+            await fetchSearchResults();
         }, 150);
     }
 
-    function renderSearchResults(results) {
+    async function fetchSearchResults(isLoadMore = false) {
+        const res = await fetch(`/api/search?q=${encodeURIComponent(searchQuery)}&current_user=${encodeURIComponent(user.username)}&offset=${searchOffset}&limit=12`);
+        const data = await res.json();
+        
+        if (isLoadMore) {
+            searchResultsList = searchResultsList.concat(data.results || []);
+        } else {
+            searchResultsList = data.results || [];
+        }
+        searchHasMore = data.has_more;
+        renderSearchResults();
+    }
+
+    function loadMoreSearch() {
+        searchOffset += 12;
+        fetchSearchResults(true);
+    }
+
+    function renderSearchResults() {
         const list = document.getElementById("chat-list");
-        list.innerHTML = `<div style="padding:10px 18px; font-size:0.75rem; color:var(--text-sub);">РЕЗУЛЬТАТЫ ПОИСКА CIPHER</div>`;
-        if (results.length === 0) {
-            list.innerHTML += `<div style="padding:18px; text-align:center; color:var(--text-sub); font-size:0.85rem;">Ничего не найдено</div>`;
+        list.innerHTML = `<div style="padding:10px 18px; font-size:0.75rem; color:var(--text-sub); display:flex; justify-content:space-between;">
+            <span>РЕЗУЛЬТАТЫ ПОИСКА</span>
+            <span>${searchResultsList.length} НАЙДЕНО</span>
+        </div>`;
+        
+        if (searchResultsList.length === 0) {
+            list.innerHTML += `<div style="padding:24px; text-align:center; color:var(--text-sub); font-size:0.85rem;">Ничего не найдено</div>`;
             return;
         }
-        results.forEach(item => {
+
+        searchResultsList.forEach(item => {
             const div = document.createElement("div");
             div.className = "chat-item";
             const isUserDev = item.is_dev;
+            
             div.onclick = () => {
                 const exists = chatsList.find(c => c.key === item.key);
-                if (!exists) {
+                if (!exists && item.type !== 'message') {
                     chatsList.unshift({
                         key: item.key,
                         name: item.name,
                         tag: item.tag,
                         type: item.type,
                         avatar: item.avatar,
-                        last_msg: item.desc || "Новый диалог",
+                        last_msg: item.extra || "Новый диалог",
                         time: "",
                         is_dev: isUserDev,
                         is_blocked: false
@@ -1503,21 +1645,33 @@ HTML_TEMPLATE = """
                 selectChat(item.key);
                 document.getElementById("search-input").value = "";
             };
+
+            const isMsg = item.type === "message";
+            const iconBadge = isMsg ? "💬 " : (item.type === "channel" ? "📢 " : "");
+
             div.innerHTML = `
                 <div class="avatar-wrap">
-                    <div class="avatar-img" style="background:${getGradient(item.name)}">${item.avatar ? `<img src="${item.avatar}" style="width:100%;height:100%;border-radius:50%;object-fit:cover;">` : item.name[0].toUpperCase()}</div>
+                    <div class="avatar-img" style="background:${getGradient(item.name)}">${item.avatar ? `<img src="${item.avatar}" style="width:100%;height:100%;border-radius:50%;object-fit:cover;">` : (isMsg ? '💬' : item.name[0].toUpperCase())}</div>
                 </div>
                 <div class="chat-details">
                     <div class="chat-name">
-                        <span>${item.name}</span>
+                        <span>${iconBadge}${highlightText(item.name, searchQuery)}</span>
                         ${isUserDev ? '<span class="dev-badge">DEV</span>' : ''}
-                        <span style="font-size:0.78rem; color:var(--badge-blue); font-weight:normal;">${item.tag}</span>
+                        <span style="font-size:0.78rem; color:var(--badge-blue); font-weight:normal;">${highlightText(item.tag, searchQuery)}</span>
                     </div>
-                    <div class="chat-preview">${item.desc || (item.type === 'user' ? 'Пользователь' : 'Канал')}</div>
+                    <div class="chat-preview">${highlightText(item.extra, searchQuery)}</div>
                 </div>
             `;
             list.appendChild(div);
         });
+
+        if (searchHasMore) {
+            const loadMore = document.createElement("div");
+            loadMore.className = "load-more-btn";
+            loadMore.innerText = "⬇️ Показать ещё результаты";
+            loadMore.onclick = loadMoreSearch;
+            list.appendChild(loadMore);
+        }
     }
 
     function renderSidebar() {
@@ -1579,7 +1733,7 @@ HTML_TEMPLATE = """
         renderAvatarEl(document.getElementById("header-avatar"), name, avatar);
 
         document.body.classList.add("in-chat");
-        renderSidebar();
+        if (!document.getElementById("search-input").value.trim()) renderSidebar();
         await loadHistory();
     }
 
