@@ -6,14 +6,14 @@ import hashlib
 import aiosqlite
 import re
 from datetime import datetime
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form, Query
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
 
-app = FastAPI(title="Cipher Messenger Mega")
+app = FastAPI(title="Cipher Messenger Pro")
 
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -31,7 +31,7 @@ DB_PATH = "messenger.db"
 DEV_USERNAMES = ["milesconxxwow", "miles"]
 
 def is_dev(username: str) -> bool:
-    return username.lower().strip().lstrip("@") in DEV_USERNAMES
+    return str(username).lower().strip().lstrip("@") in DEV_USERNAMES
 
 def hash_password(password: str) -> str:
     return hashlib.sha256(password.encode("utf-8")).hexdigest()
@@ -39,14 +39,13 @@ def hash_password(password: str) -> str:
 def normalize_text(text: str) -> str:
     if not text:
         return ""
-    text = text.lower()
-    return re.sub(r"[@#\-_.,!?/\\]+", "", text).strip()
+    return re.sub(r"[@#\-_.,!?/\\]+", "", str(text).lower()).strip()
 
 def calculate_score(query: str, target: str) -> int:
     if not query or not target:
         return 0
-    q = query.lower().strip()
-    t = target.lower().strip()
+    q = str(query).lower().strip()
+    t = str(target).lower().strip()
     if q == t:
         return 100
     if t.startswith(q):
@@ -116,6 +115,25 @@ async def init_db():
                 UNIQUE(blocker, blocked)
             )
         """)
+        
+        # Автоматическая миграция (добавление колонок, если база старая)
+        migrations = [
+            ("users", "custom_status", "TEXT DEFAULT 'online'"),
+            ("users", "last_seen", "TEXT DEFAULT ''"),
+            ("channels", "is_group", "INTEGER DEFAULT 0"),
+            ("channels", "members", "TEXT DEFAULT '[]'"),
+            ("messages", "forward_from", "TEXT DEFAULT ''"),
+            ("messages", "is_read", "INTEGER DEFAULT 0"),
+            ("messages", "is_edited", "INTEGER DEFAULT 0"),
+            ("messages", "is_deleted", "INTEGER DEFAULT 0"),
+            ("messages", "reactions", "TEXT DEFAULT '{}'")
+        ]
+        for tbl, col, ctype in migrations:
+            try:
+                await db.execute(f"ALTER TABLE {tbl} ADD COLUMN {col} {ctype}")
+            except Exception:
+                pass
+
         await db.commit()
 
 class ConnectionManager:
@@ -131,9 +149,12 @@ class ConnectionManager:
         if username in self.active_connections:
             del self.active_connections[username]
             time_now = datetime.now().strftime("%H:%M")
-            async with aiosqlite.connect(DB_PATH) as db:
-                await db.execute("UPDATE users SET last_seen = ? WHERE username = ?", (time_now, username))
-                await db.commit()
+            try:
+                async with aiosqlite.connect(DB_PATH) as db:
+                    await db.execute("UPDATE users SET last_seen = ? WHERE username = ?", (time_now, username))
+                    await db.commit()
+            except Exception:
+                pass
         await self.broadcast_online()
 
     async def broadcast_online(self):
@@ -152,8 +173,8 @@ class ConnectionManager:
             except Exception:
                 pass
 
-    async def broadcast_channel(self, message: dict, sender_username: str = None):
-        for uname, conn in list(self.active_connections.items()):
+    async def broadcast_channel(self, message: dict):
+        for conn in list(self.active_connections.values()):
             try:
                 await conn.send_text(json.dumps(message))
             except Exception:
@@ -324,34 +345,6 @@ async def create_channel(tag: str = Form(...), name: str = Form(...), desc: str 
 
     return {"status": "ok", "channel_tag": clean_tag, "name": clean_name, "avatar_url": avatar_url}
 
-@app.post("/api/update_channel")
-async def update_channel(tag: str = Form(...), name: str = Form(...), desc: str = Form(""), requester: str = Form(...), file: UploadFile = File(None)):
-    clean_tag = tag.strip().lstrip("#").lower()
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT creator_username, avatar_url FROM channels WHERE channel_tag = ?", (clean_tag,))
-        row = await cur.fetchone()
-        if not row:
-            return {"status": "error", "message": "Канал не найден"}
-        if row[0] != requester and not is_dev(requester):
-            return {"status": "error", "message": "Только создатель может менять канал"}
-
-        avatar_url = row[1]
-        if file and file.filename:
-            ext = file.filename.split(".")[-1].lower()
-            filename = f"chan_{clean_tag}_{uuid.uuid4().hex[:8]}.{ext}"
-            path = os.path.join(UPLOAD_DIR, filename)
-            with open(path, "wb") as buf:
-                shutil.copyfileobj(file.file, buf)
-            avatar_url = f"/uploads/{filename}"
-
-        await db.execute(
-            "UPDATE channels SET name = ?, description = ?, avatar_url = ? WHERE channel_tag = ?",
-            (name.strip(), desc.strip(), avatar_url, clean_tag)
-        )
-        await db.commit()
-
-    return {"status": "ok", "name": name.strip(), "description": desc.strip(), "avatar_url": avatar_url}
-
 @app.get("/api/user_info")
 async def get_user_info(username: str, current_user: str):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -400,7 +393,6 @@ async def get_user_chats(username: str):
         cur_blk = await db.execute("SELECT blocked FROM blocks WHERE blocker = ?", (username,))
         blocked_list = [r[0] for r in await cur_blk.fetchall()]
 
-        # Каналы и Группы
         cur_ch = await db.execute("SELECT channel_tag, name, avatar_url, pinned_msg_id, is_group, description, creator_username FROM channels")
         for ch in await cur_ch.fetchall():
             tag_key = f"#{ch[0]}"
@@ -431,7 +423,6 @@ async def get_user_chats(username: str):
                 "is_blocked": False
             })
 
-        # Приватные чаты
         cur_peers = await db.execute("""
             SELECT DISTINCT 
                 CASE WHEN sender_username = ? THEN target ELSE sender_username END AS peer
@@ -460,8 +451,8 @@ async def get_user_chats(username: str):
             last_read = 0
             last_sender = ""
             if last:
-                last_read = last[3]
-                last_sender = last[4]
+                last_read = last[3] or 0
+                last_sender = last[4] or ""
                 if last[1] == "voice": last_text = "🎙️ Голосовое"
                 elif last[1] == "image": last_text = "📷 Фотография"
                 elif last[1] == "video": last_text = "🎬 Видео"
@@ -487,8 +478,8 @@ async def get_user_chats(username: str):
         return {"chats": chats}
 
 @app.get("/api/search")
-async def search(q: str, current_user: str = "", offset: int = 0, limit: int = 15):
-    raw_query = q.strip()
+async def search(q: str = "", current_user: str = "", offset: int = 0, limit: int = 15):
+    raw_query = str(q).strip()
     clean_q = raw_query.lstrip('@').lstrip('#').lower()
     if not clean_q:
         return {"results": [], "has_more": False}
@@ -540,10 +531,10 @@ async def search(q: str, current_user: str = "", offset: int = 0, limit: int = 1
                 WHERE is_deleted = 0 
                   AND msg_type = 'text' 
                   AND (sender_username = ? OR target = ? OR target LIKE '#%')
-                ORDER BY id DESC LIMIT 200
+                ORDER BY id DESC LIMIT 150
             """, (current_user, current_user))
             for m in await cur_m.fetchall():
-                mid, s_user, s_name, target, text, m_time = m[0], m[1], m[2], m[3], m[4], m[5]
+                mid, s_user, s_name, target, text, m_time = m[0], m[1], m[2], m[3], m[4] or "", m[5]
                 if clean_q in text.lower():
                     dialog_key = target if target.startswith("#") else (s_user if s_user != current_user else target)
                     results.append({
@@ -591,19 +582,19 @@ async def get_history(user: str, target: str):
             "sender_username": r[1],
             "sender_name": r[2],
             "target": r[3],
-            "text": r[4],
-            "msg_type": r[5],
-            "file_url": r[6],
-            "file_name": r[7],
-            "reply_to_id": r[8],
-            "reply_to_text": r[9],
-            "reply_to_sender": r[10],
-            "forward_from": r[11],
+            "text": r[4] or "",
+            "msg_type": r[5] or "text",
+            "file_url": r[6] or "",
+            "file_name": r[7] or "",
+            "reply_to_id": r[8] or 0,
+            "reply_to_text": r[9] or "",
+            "reply_to_sender": r[10] or "",
+            "forward_from": r[11] or "",
             "reactions": json.loads(r[12] or "{}"),
             "is_read": bool(r[13]),
             "is_edited": bool(r[14]),
             "time": r[16],
-            "avatar": r[17],
+            "avatar": r[17] or "",
             "is_dev": is_dev(r[1])
         } for r in rows]
 
@@ -1183,6 +1174,20 @@ HTML_TEMPLATE = """
             justify-content: center;
         }
 
+        .load-more-btn {
+            background: var(--bg-sidebar-hover);
+            color: var(--badge-blue);
+            border: 1px solid var(--border-color);
+            padding: 10px;
+            border-radius: 10px;
+            margin: 12px 18px;
+            font-weight: 600;
+            font-size: 0.85rem;
+            cursor: pointer;
+            text-align: center;
+        }
+        .load-more-btn:hover { opacity: 0.8; }
+
         .msg-menu {
             position: fixed;
             background: var(--card-bg);
@@ -1249,7 +1254,6 @@ HTML_TEMPLATE = """
     <div class="msg-menu-item" id="menu-del-btn" style="color: #ef4444;" onclick="deleteMessage()">🗑️ Удалить</div>
 </div>
 
-<!-- Модалка Авторизации -->
 <div id="auth-modal" class="modal-overlay">
     <div class="card-modal">
         <div class="brand-logo">⚡ CIPHER<span>.</span></div>
@@ -1265,13 +1269,12 @@ HTML_TEMPLATE = """
     </div>
 </div>
 
-<!-- Модалка Создания Канала / Группы -->
 <div id="channel-modal" class="modal-overlay" style="display: none;">
     <div class="card-modal">
-        <h2 id="modal-chan-title">Создать канал или группу</h2>
+        <h2>Создать канал или группу</h2>
         <p class="subtitle">Публичное пространство или групповая беседа</p>
         
-        <select id="chan-type-select" onchange="toggleGroupCreation(this.value)">
+        <select id="chan-type-select">
             <option value="0">📢 Канал (вещание)</option>
             <option value="1">👥 Групповой чат (беседа)</option>
         </select>
@@ -1286,7 +1289,6 @@ HTML_TEMPLATE = """
     </div>
 </div>
 
-<!-- Модалка Редактирования Канала -->
 <div id="edit-channel-modal" class="modal-overlay" style="display: none;">
     <div class="card-modal">
         <h2>Настройки канала</h2>
@@ -1302,7 +1304,6 @@ HTML_TEMPLATE = """
     </div>
 </div>
 
-<!-- Модалка Профиля -->
 <div id="profile-modal" class="modal-overlay" style="display: none;">
     <div class="card-modal" style="text-align: center;">
         <h2>Мой профиль</h2>
@@ -1329,7 +1330,6 @@ HTML_TEMPLATE = """
     </div>
 </div>
 
-<!-- Модалка Просмотра Чужого Профиля -->
 <div id="user-info-modal" class="modal-overlay" style="display: none;">
     <div class="card-modal" style="text-align: center;">
         <h2>Профиль пользователя</h2>
@@ -1347,7 +1347,6 @@ HTML_TEMPLATE = """
     </div>
 </div>
 
-<!-- Модалка Пересылки Сообщения -->
 <div id="forward-modal" class="modal-overlay" style="display: none;">
     <div class="card-modal">
         <h2>Переслать сообщение</h2>
@@ -1464,7 +1463,6 @@ HTML_TEMPLATE = """
     let isRecording = false;
     let typingTimeout = null;
 
-    // Инициализация темы
     document.documentElement.setAttribute("data-theme", currentTheme);
 
     function toggleTheme() {
@@ -1473,15 +1471,14 @@ HTML_TEMPLATE = """
         localStorage.setItem("messenger_theme", currentTheme);
     }
 
-    // Звук нового сообщения через Web Audio API
     function playNotificationSound() {
         try {
             const ctx = new (window.AudioContext || window.webkitAudioContext)();
             const osc = ctx.createOscillator();
             const gain = ctx.createGain();
             osc.type = "sine";
-            osc.frequency.setValueAtTime(587.33, ctx.currentTime); // D5
-            osc.frequency.exponentialRampToValueAtTime(880, ctx.currentTime + 0.1); // A5
+            osc.frequency.setValueAtTime(587.33, ctx.currentTime);
+            osc.frequency.exponentialRampToValueAtTime(880, ctx.currentTime + 0.1);
             gain.gain.setValueAtTime(0.2, ctx.currentTime);
             gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.25);
             osc.connect(gain);
@@ -1491,7 +1488,6 @@ HTML_TEMPLATE = """
         } catch(e) {}
     }
 
-    // Запрос прав на браузерные Push-уведомления
     if ("Notification" in window && Notification.permission !== "granted" && Notification.permission !== "denied") {
         Notification.requestPermission();
     }
@@ -1504,7 +1500,7 @@ HTML_TEMPLATE = """
 
     const DEV_USERS = ["milesconxxwow", "miles"];
     function checkIsDev(uname) {
-        return uname && DEV_USERS.includes(uname.toLowerCase().replace("@", ""));
+        return uname && DEV_USERS.includes(String(uname).toLowerCase().replace("@", ""));
     }
 
     const gradients = [
@@ -1517,7 +1513,8 @@ HTML_TEMPLATE = """
 
     function getGradient(str) {
         let hash = 0;
-        for (let i = 0; i < (str || "user").length; i++) hash += str.charCodeAt(i);
+        const val = String(str || "user");
+        for (let i = 0; i < val.length; i++) hash += val.charCodeAt(i);
         return gradients[hash % gradients.length];
     }
 
@@ -1532,17 +1529,11 @@ HTML_TEMPLATE = """
     function highlightText(text, query) {
         if (!text) return "";
         if (!query) return escapeHtml(text);
-        const cleanQ = query.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&').lstrip('@').lstrip('#');
+        const cleanQ = String(query).replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&').replace(/^[@#]+/, "");
         if (!cleanQ) return escapeHtml(text);
         const regex = new RegExp(`(${cleanQ})`, "gi");
         return escapeHtml(text).replace(regex, `<mark class="hl">$1</mark>`);
     }
-
-    String.prototype.lstrip = function (chars) {
-        let start = 0;
-        while (start < this.length && chars.indexOf(this[start]) >= 0) start++;
-        return this.substring(start);
-    };
 
     function renderAvatarEl(el, name, avatarUrl) {
         if (avatarUrl) {
@@ -1641,7 +1632,7 @@ HTML_TEMPLATE = """
         ws.onmessage = (e) => {
             const data = JSON.parse(e.data);
             if (data.type === "online_list") {
-                onlineUsers = data.users;
+                onlineUsers = data.users || [];
                 if (!document.getElementById("search-input").value.trim()) renderSidebar();
             } else if (data.type === "typing" && data.sender === currentTarget) {
                 document.getElementById("header-sub").innerText = "печатает...";
@@ -1832,7 +1823,7 @@ HTML_TEMPLATE = """
     let searchTimeout = null;
     function handleSearch(val) {
         clearTimeout(searchTimeout);
-        searchQuery = val.trim();
+        searchQuery = (val || "").trim();
         searchOffset = 0;
         searchResultsList = [];
 
@@ -1846,16 +1837,23 @@ HTML_TEMPLATE = """
     }
 
     async function fetchSearchResults(isLoadMore = false) {
-        const res = await fetch(`/api/search?q=${encodeURIComponent(searchQuery)}&current_user=${encodeURIComponent(user.username)}&offset=${searchOffset}&limit=12`);
-        const data = await res.json();
-        
-        if (isLoadMore) {
-            searchResultsList = searchResultsList.concat(data.results || []);
-        } else {
-            searchResultsList = data.results || [];
-        }
-        searchHasMore = data.has_more;
-        renderSearchResults();
+        try {
+            const res = await fetch(`/api/search?q=${encodeURIComponent(searchQuery)}&current_user=${encodeURIComponent(user.username)}&offset=${searchOffset}&limit=12`);
+            const data = await res.json();
+            
+            if (isLoadMore) {
+                searchResultsList = searchResultsList.concat(data.results || []);
+            } else {
+                searchResultsList = data.results || [];
+            }
+            searchHasMore = data.has_more;
+            renderSearchResults();
+        } catch(e) {}
+    }
+
+    function loadMoreSearch() {
+        searchOffset += 12;
+        fetchSearchResults(true);
     }
 
     function renderSearchResults() {
@@ -1912,6 +1910,14 @@ HTML_TEMPLATE = """
             `;
             list.appendChild(div);
         });
+
+        if (searchHasMore) {
+            const loadMore = document.createElement("div");
+            loadMore.className = "load-more-btn";
+            loadMore.innerText = "⬇️ Показать ещё результаты";
+            loadMore.onclick = loadMoreSearch;
+            list.appendChild(loadMore);
+        }
     }
 
     function renderSidebar() {
@@ -2004,7 +2010,7 @@ HTML_TEMPLATE = """
         document.body.classList.add("in-chat");
         if (!document.getElementById("search-input").value.trim()) renderSidebar();
         
-        if (ws && !key.startsWith("#")) {
+        if (ws && ws.readyState === WebSocket.OPEN && !key.startsWith("#")) {
             ws.send(JSON.stringify({ action: "read", target: key }));
         }
         await loadHistory();
@@ -2012,9 +2018,11 @@ HTML_TEMPLATE = """
 
     async function loadHistory() {
         if (!currentTarget) return;
-        const res = await fetch(`/api/history?user=${encodeURIComponent(user.username)}&target=${encodeURIComponent(currentTarget)}`);
-        currentMessages = await res.json();
-        renderAllMessages();
+        try {
+            const res = await fetch(`/api/history?user=${encodeURIComponent(user.username)}&target=${encodeURIComponent(currentTarget)}`);
+            currentMessages = await res.json();
+            renderAllMessages();
+        } catch(e) {}
     }
 
     function renderAllMessages() {
@@ -2102,7 +2110,7 @@ HTML_TEMPLATE = """
     }
 
     function sendReaction(emoji) {
-        if (!selectedMsg || !ws) return;
+        if (!selectedMsg || !ws || ws.readyState !== WebSocket.OPEN) return;
         ws.send(JSON.stringify({
             action: "reaction",
             msg_id: selectedMsg.id,
@@ -2113,7 +2121,7 @@ HTML_TEMPLATE = """
     }
 
     function toggleReaction(msgId, emoji) {
-        if (!ws) return;
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
         ws.send(JSON.stringify({
             action: "reaction",
             msg_id: msgId,
@@ -2127,7 +2135,7 @@ HTML_TEMPLATE = """
         editMsg = null;
         forwardMsg = null;
         document.getElementById("action-title").innerText = `Ответ пользователю @${replyMsg.sender_username}`;
-        document.getElementById("action-text").innerText = replyMsg.text || (replyMsg.msg_type === 'image' ? '📷 Фото' : '🎙️ Голосовое');
+        document.getElementById("action-text").innerText = replyMsg.text || (replyMsg.msg_type === 'image' ? '📷 Фото' : (replyMsg.msg_type === 'video' ? '🎬 Видео' : '🎙️ Голосовое'));
         document.getElementById("action-banner").style.display = "flex";
         document.getElementById("msg-input").focus();
     }
@@ -2154,7 +2162,7 @@ HTML_TEMPLATE = """
     }
 
     function sendForwardTo(targetKey) {
-        if (!forwardMsg || !ws) return;
+        if (!forwardMsg || !ws || ws.readyState !== WebSocket.OPEN) return;
         const timeStr = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
         const payload = {
             action: "send",
@@ -2194,7 +2202,7 @@ HTML_TEMPLATE = """
     }
 
     function deleteMessage() {
-        if (!selectedMsg || !ws) return;
+        if (!selectedMsg || !ws || ws.readyState !== WebSocket.OPEN) return;
         if (confirm("Удалить это сообщение?")) {
             ws.send(JSON.stringify({
                 action: "delete",
@@ -2217,7 +2225,7 @@ HTML_TEMPLATE = """
     }
 
     function handleTyping() {
-        if (ws && currentTarget && !currentTarget.startsWith("#")) {
+        if (ws && ws.readyState === WebSocket.OPEN && currentTarget && !currentTarget.startsWith("#")) {
             ws.send(JSON.stringify({ action: "typing", target: currentTarget }));
         }
     }
@@ -2246,7 +2254,9 @@ HTML_TEMPLATE = """
                 avatar: user.avatar_url || "",
                 time: timeStr
             };
-            ws.send(JSON.stringify(payload));
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify(payload));
+            }
             cancelAction();
         }
         document.getElementById("media-file-input").value = "";
@@ -2286,7 +2296,7 @@ HTML_TEMPLATE = """
     function sendMsg() {
         const input = document.getElementById("msg-input");
         const text = input.value.trim();
-        if (!text || !ws || !currentTarget) return;
+        if (!text || !ws || ws.readyState !== WebSocket.OPEN || !currentTarget) return;
 
         if (editMsg) {
             ws.send(JSON.stringify({
@@ -2323,7 +2333,7 @@ HTML_TEMPLATE = """
 
     function escapeHtml(str) {
         if (!str) return "";
-        return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+        return String(str).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
     }
 </script>
 </body>
@@ -2349,7 +2359,6 @@ async def ws_endpoint(websocket: WebSocket, username: str):
                 continue
 
             elif action == "read":
-                # Собеседник прочитал сообщения
                 async with aiosqlite.connect(DB_PATH) as db:
                     await db.execute("UPDATE messages SET is_read = 1 WHERE sender_username = ? AND target = ?", (target, username))
                     await db.commit()
