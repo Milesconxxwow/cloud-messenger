@@ -289,13 +289,11 @@ async def update_profile(data: UpdateProfileModel):
         return {"status": "error", "message": "Имя и email не могут быть пустыми"}
 
     async with aiosqlite.connect(DB_PATH) as db:
-        # Проверяем, не занят ли email другим пользователем
         cur_e = await db.execute("SELECT id FROM users WHERE LOWER(email) = LOWER(?) AND LOWER(username) != LOWER(?)", (new_email, uname))
         if await cur_e.fetchone():
             return {"status": "error", "message": "Этот Email уже занят другим аккаунтом"}
 
         await db.execute("UPDATE users SET display_name = ?, email = ? WHERE LOWER(username) = LOWER(?)", (new_name, new_email, uname))
-        # Обновляем имя отправителя в сообщениях
         await db.execute("UPDATE messages SET sender_name = ? WHERE LOWER(sender_username) = LOWER(?)", (new_name, uname))
         await db.commit()
 
@@ -1385,8 +1383,11 @@ HTML_TEMPLATE = """
             <label style="font-size: 0.8rem; color: var(--text-sub); display: block; margin-bottom:4px;">Email почта:</label>
             <input type="email" id="profile-email-input" placeholder="Ваш email">
 
-            <label style="font-size: 0.8rem; color: var(--text-sub); display: block; margin-bottom:4px;">Юзернейм (логин):</label>
-            <p id="profile-tag" style="color: var(--badge-blue); font-size: 0.9rem; margin-bottom: 12px;"></p>
+            <label style="font-size: 0.8rem; color: var(--text-sub); display: block; margin-bottom:4px;">Юзернейм:</label>
+            <div style="display:flex; align-items:center; gap:8px; margin-bottom: 12px;">
+                <p id="profile-tag" style="color: var(--badge-blue); font-size: 0.95rem; font-weight: bold;"></p>
+                <span id="profile-dev-badge" class="dev-badge" style="display:none;">🛠️ DEV</span>
+            </div>
         </div>
         
         <label style="font-size: 0.8rem; color: var(--text-sub); display: block; text-align:left; margin-bottom:4px;">Личный статус:</label>
@@ -1611,6 +1612,7 @@ HTML_TEMPLATE = """
     }
 
     function renderAvatarEl(el, name, avatarUrl) {
+        if (!el) return;
         if (avatarUrl) {
             el.innerHTML = `<img src="${avatarUrl}" class="msg-avatar" style="width:100%; height:100%; border-radius:50%; object-fit:cover;">`;
             el.style.background = "transparent";
@@ -1710,8 +1712,8 @@ HTML_TEMPLATE = """
         renderAvatarEl(document.getElementById("my-avatar-mini"), user.display_name, user.avatar_url);
 
         if (checkIsDev(user.username)) {
-            document.getElementById("my-dev-badge").style.display = "inline-flex";
-            document.getElementById("profile-dev-badge").style.display = "inline-flex";
+            const myDevBadge = document.getElementById("my-dev-badge");
+            if (myDevBadge) myDevBadge.style.display = "inline-flex";
         }
 
         const protocol = location.protocol === "https:" ? "wss:" : "ws:";
@@ -1767,25 +1769,37 @@ HTML_TEMPLATE = """
     }
 
     function openProfile() {
-        document.getElementById("profile-name-input").value = user.display_name;
-        document.getElementById("profile-email-input").value = user.email || "";
-        document.getElementById("profile-tag").innerText = "@" + user.username;
+        const nameInput = document.getElementById("profile-name-input");
+        const emailInput = document.getElementById("profile-email-input");
+        const tagEl = document.getElementById("profile-tag");
+        const statusSelect = document.getElementById("user-status-select");
+
+        if (nameInput) nameInput.value = user.display_name || "";
+        if (emailInput) emailInput.value = user.email || "";
+        if (tagEl) tagEl.innerText = "@" + user.username;
+
         renderAvatarEl(document.getElementById("profile-avatar-preview"), user.display_name, user.avatar_url);
-        if (checkIsDev(user.username)) document.getElementById("profile-dev-badge").style.display = "inline-flex";
-        document.getElementById("user-status-select").value = user.custom_status || "online";
+        
+        const devBadge = document.getElementById("profile-dev-badge");
+        if (devBadge) {
+            devBadge.style.display = checkIsDev(user.username) ? "inline-flex" : "none";
+        }
+        if (statusSelect) {
+            statusSelect.value = user.custom_status || "online";
+        }
+
         document.getElementById("profile-modal").style.display = "flex";
     }
 
     async function saveProfileChanges() {
         const newName = document.getElementById("profile-name-input").value.trim();
-        const newEmail = document.getElementById("profile-email-input").value.trim().lower();
+        const newEmail = document.getElementById("profile-email-input").value.trim().toLowerCase();
         const fileInput = document.getElementById("profile-file");
 
         if (!newName || !newEmail) {
             return alert("Заполните ник и email");
         }
 
-        // Обновление ника и email
         const res = await fetch("/api/update_profile", {
             method: "POST",
             headers: {"Content-Type": "application/json"},
@@ -1799,7 +1813,6 @@ HTML_TEMPLATE = """
         user.display_name = newName;
         user.email = newEmail;
 
-        // Если выбран новый файл аватарки
         if (fileInput.files[0]) {
             const form = new FormData();
             form.append("username", user.username);
@@ -2493,7 +2506,7 @@ async def ws_endpoint(websocket: WebSocket, username: str):
                             reacts[emoji] = {"count": 1, "users": [uname]}
                         else:
                             if isinstance(reacts[emoji], int):
-                                reacts[emoji] = {"count": reacts[emoji] + 1, "users": [username]}
+                                reacts[emoji] = {"count": reacts[emoji] + 1, "users": [uname]}
                             else:
                                 if uname in reacts[emoji]["users"]:
                                     reacts[emoji]["users"].remove(uname)
