@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
 
-app = FastAPI(title="Cipher Messenger Pro")
+app = FastAPI(title="Cipher Messenger Pro with Admin Panel")
 
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -30,7 +30,7 @@ app.add_middleware(
 DB_PATH = "messenger.db"
 DEV_USERNAMES = ["milesconxxwow", "miles"]
 
-def is_dev(username: str) -> bool:
+def is_admin(username: str) -> bool:
     return str(username).lower().strip().lstrip("@") in DEV_USERNAMES
 
 def hash_password(password: str) -> str:
@@ -68,6 +68,8 @@ async def init_db():
                 avatar_url TEXT DEFAULT '',
                 custom_status TEXT DEFAULT 'online',
                 last_seen TEXT DEFAULT '',
+                is_admin INTEGER DEFAULT 0,
+                is_banned INTEGER DEFAULT 0,
                 created_at TEXT NOT NULL
             )
         """)
@@ -114,10 +116,21 @@ async def init_db():
                 UNIQUE(blocker, blocked)
             )
         """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS reports (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                reporter TEXT NOT NULL COLLATE NOCASE,
+                reported_user TEXT NOT NULL COLLATE NOCASE,
+                reason TEXT NOT NULL,
+                timestamp TEXT NOT NULL
+            )
+        """)
 
         migrations = [
             ("users", "custom_status", "TEXT DEFAULT 'online'"),
             ("users", "last_seen", "TEXT DEFAULT ''"),
+            ("users", "is_admin", "INTEGER DEFAULT 0"),
+            ("users", "is_banned", "INTEGER DEFAULT 0"),
             ("channels", "members", "TEXT DEFAULT '[]'"),
             ("messages", "forward_from", "TEXT DEFAULT ''"),
             ("messages", "is_read", "INTEGER DEFAULT 0"),
@@ -214,6 +227,17 @@ class ChannelMemberModel(BaseModel):
     username: str
     requester: str = ""
 
+class ReportModel(BaseModel):
+    reporter: str
+    reported_user: str
+    reason: str
+
+class AdminActionModel(BaseModel):
+    admin_username: str
+    target_username: str
+    action: str  # "ban", "unban", "make_admin", "remove_admin", "delete_report"
+    report_id: int = 0
+
 @app.post("/api/register")
 async def register(data: RegisterModel):
     email = data.email.strip().lower()
@@ -243,9 +267,11 @@ async def register(data: RegisterModel):
 
         pwd_hash = hash_password(pwd)
         created_at = datetime.now().strftime("%Y-%m-%d %H:%M")
+        admin_flag = 1 if is_admin(uname) else 0
+
         await db.execute(
-            "INSERT INTO users (email, username, display_name, password_hash, created_at) VALUES (?, ?, ?, ?, ?)",
-            (email, uname, name, pwd_hash, created_at)
+            "INSERT INTO users (email, username, display_name, password_hash, is_admin, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (email, uname, name, pwd_hash, admin_flag, created_at)
         )
         await db.commit()
         return {
@@ -255,7 +281,8 @@ async def register(data: RegisterModel):
             "email": email,
             "avatar_url": "",
             "custom_status": "online",
-            "is_dev": is_dev(uname)
+            "is_admin": admin_flag,
+            "is_dev": is_admin(uname)
         }
 
 @app.post("/api/login")
@@ -265,13 +292,24 @@ async def login(data: LoginModel):
 
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            """SELECT username, display_name, email, avatar_url, custom_status 
+            """SELECT username, display_name, email, avatar_url, custom_status, is_admin, is_banned 
                FROM users 
                WHERE (LOWER(email) = LOWER(?) OR LOWER(username) = LOWER(?)) AND password_hash = ?""",
             (login_val, login_val, pwd_hash)
         )
         user = await cur.fetchone()
         if user:
+            if user[6] == 1:
+                return {"status": "error", "message": "Ваш аккаунт заблокирован администратором."}
+            
+            # Автоматически выдаем админку если в DEV_USERNAMES
+            if is_admin(user[0]) and user[5] == 0:
+                await db.execute("UPDATE users SET is_admin = 1 WHERE LOWER(username) = LOWER(?)", (user[0],))
+                await db.commit()
+                user_is_admin = 1
+            else:
+                user_is_admin = user[5]
+
             return {
                 "status": "ok",
                 "username": user[0],
@@ -279,7 +317,8 @@ async def login(data: LoginModel):
                 "email": user[2],
                 "avatar_url": user[3] or "",
                 "custom_status": user[4] or "online",
-                "is_dev": is_dev(user[0])
+                "is_admin": user_is_admin,
+                "is_dev": is_admin(user[0])
             }
         return {"status": "error", "message": "Неверный логин или пароль"}
 
@@ -368,6 +407,90 @@ async def update_status(data: StatusModel):
         await db.commit()
     return {"status": "ok"}
 
+@app.post("/api/report")
+async def report_user(data: ReportModel):
+    async with aiosqlite.connect(DB_PATH) as db:
+        time_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+        await db.execute(
+            "INSERT INTO reports (reporter, reported_user, reason, timestamp) VALUES (?, ?, ?, ?)",
+            (data.reporter.lower(), data.reported_user.lower(), data.reason.strip(), time_str)
+        )
+        await db.commit()
+    return {"status": "ok"}
+
+@app.get("/api/admin/data")
+async def get_admin_data(username: str):
+    uname = username.strip().lower()
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur_adm = await db.execute("SELECT is_admin FROM users WHERE LOWER(username) = LOWER(?)", (uname,))
+        row = await cur_adm.fetchone()
+        if not row or (row[0] != 1 and not is_admin(uname)):
+            return {"status": "error", "message": "Доступ запрещен"}
+
+        # Пользователи
+        cur_u = await db.execute("SELECT username, display_name, email, custom_status, last_seen, is_admin, is_banned FROM users")
+        users = []
+        for u in await cur_u.fetchall():
+            users.append({
+                "username": u[0],
+                "display_name": u[1],
+                "email": u[2],
+                "custom_status": u[3],
+                "last_seen": u[4],
+                "is_admin": u[5],
+                "is_banned": u[6],
+                "is_online": u[0].lower() in manager.active_connections
+            })
+
+        # Жалобы
+        cur_r = await db.execute("SELECT id, reporter, reported_user, reason, timestamp FROM reports ORDER BY id DESC")
+        reports = []
+        for r in await cur_r.fetchall():
+            reports.append({
+                "id": r[0],
+                "reporter": r[1],
+                "reported_user": r[2],
+                "reason": r[3],
+                "timestamp": r[4]
+            })
+
+        return {
+            "status": "ok",
+            "online_count": len(manager.active_connections),
+            "users": users,
+            "reports": reports
+        }
+
+@app.post("/api/admin/action")
+async def admin_action(data: AdminActionModel):
+    adm = data.admin_username.strip().lower()
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur_adm = await db.execute("SELECT is_admin FROM users WHERE LOWER(username) = LOWER(?)", (adm,))
+        row = await cur_adm.fetchone()
+        if not row or (row[0] != 1 and not is_admin(adm)):
+            return {"status": "error", "message": "Недостаточно прав"}
+
+        target = data.target_username.strip().lower()
+        act = data.action
+
+        if act == "ban":
+            await db.execute("UPDATE users SET is_banned = 1 WHERE LOWER(username) = LOWER(?)", (target,))
+            if target in manager.active_connections:
+                await manager.active_connections[target].send_text(json.dumps({"type": "banned"}))
+                del manager.active_connections[target]
+        elif act == "unban":
+            await db.execute("UPDATE users SET is_banned = 0 WHERE LOWER(username) = LOWER(?)", (target,))
+        elif act == "make_admin":
+            await db.execute("UPDATE users SET is_admin = 1 WHERE LOWER(username) = LOWER(?)", (target,))
+        elif act == "remove_admin":
+            if not is_admin(target):
+                await db.execute("UPDATE users SET is_admin = 0 WHERE LOWER(username) = LOWER(?)", (target,))
+        elif act == "delete_report":
+            await db.execute("DELETE FROM reports WHERE id = ?", (data.report_id,))
+
+        await db.commit()
+    return {"status": "ok"}
+
 @app.post("/api/create_channel")
 async def create_channel(tag: str = Form(...), name: str = Form(...), desc: str = Form(""), creator: str = Form(...), file: UploadFile = File(None)):
     clean_tag = tag.strip().lstrip("#").lower()
@@ -410,7 +533,7 @@ async def update_channel(tag: str = Form(...), name: str = Form(...), desc: str 
         row = await cur.fetchone()
         if not row:
             return {"status": "error", "message": "Канал не найден"}
-        if row[0].lower() != req_uname and not is_dev(req_uname):
+        if row[0].lower() != req_uname and not is_admin(req_uname):
             return {"status": "error", "message": "Только создатель может менять канал"}
 
         avatar_url = row[1]
@@ -439,7 +562,7 @@ async def delete_channel(data: ChannelMemberModel):
         row = await cur.fetchone()
         if not row:
             return {"status": "error", "message": "Канал не найден"}
-        if row[0].lower() != req_uname and not is_dev(req_uname):
+        if row[0].lower() != req_uname and not is_admin(req_uname):
             return {"status": "error", "message": "Только создатель может удалить канал"}
 
         await db.execute("DELETE FROM channels WHERE LOWER(channel_tag) = LOWER(?)", (clean_tag,))
@@ -474,7 +597,6 @@ async def leave_channel(data: ChannelMemberModel):
         if not row:
             return {"status": "error", "message": "Канал не найден"}
         
-        # Создатель не может покинуть свой канал, он может только удалить его
         if row[1].lower() == uname:
             return {"status": "error", "message": "Создатель не может покинуть канал. Вы можете удалить его в настройках."}
 
@@ -496,7 +618,7 @@ async def add_channel_member(data: ChannelMemberModel):
         row = await cur.fetchone()
         if not row:
             return {"status": "error", "message": "Канал не найден"}
-        if row[0].lower() != req_uname and not is_dev(req_uname):
+        if row[0].lower() != req_uname and not is_admin(req_uname):
             return {"status": "error", "message": "Только владелец может добавлять участников"}
 
         cur_u = await db.execute("SELECT id FROM users WHERE LOWER(username) = LOWER(?)", (target_user,))
@@ -517,7 +639,7 @@ async def get_user_info(username: str, current_user: str):
     cur_uname = current_user.strip().lower()
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "SELECT username, display_name, email, avatar_url, created_at, custom_status, last_seen FROM users WHERE LOWER(username) = LOWER(?)",
+            "SELECT username, display_name, email, avatar_url, created_at, custom_status, last_seen, is_admin FROM users WHERE LOWER(username) = LOWER(?)",
             (target_uname,)
         )
         row = await cur.fetchone()
@@ -536,7 +658,8 @@ async def get_user_info(username: str, current_user: str):
             "created_at": row[4],
             "custom_status": row[5] or "online",
             "last_seen": row[6] or "",
-            "is_dev": is_dev(row[0]),
+            "is_admin": bool(row[7]) or is_admin(row[0]),
+            "is_dev": is_admin(row[0]),
             "is_blocked": is_blocked
         }
 
@@ -570,7 +693,7 @@ async def get_user_chats(username: str):
             creator = ch[5]
             members = [m.lower() for m in json.loads(ch[6] or "[]")]
             
-            if uname not in members and creator.lower() != uname and not is_dev(uname):
+            if uname not in members and creator.lower() != uname and not is_admin(uname):
                 continue
 
             cur_last = await db.execute(
@@ -612,7 +735,7 @@ async def get_user_chats(username: str):
         peers = [r[0].lower() for r in await cur_peers.fetchall() if r[0].lower() != uname and not r[0].startswith("#")]
 
         for p in peers:
-            cur_u = await db.execute("SELECT username, display_name, avatar_url, custom_status, last_seen FROM users WHERE LOWER(username) = LOWER(?)", (p,))
+            cur_u = await db.execute("SELECT username, display_name, avatar_url, custom_status, last_seen, is_admin FROM users WHERE LOWER(username) = LOWER(?)", (p,))
             u_data = await cur_u.fetchone()
             if not u_data:
                 continue
@@ -621,6 +744,7 @@ async def get_user_chats(username: str):
             avatar = u_data[2] or ""
             status = u_data[3] or "online"
             last_seen = u_data[4] or ""
+            adm = bool(u_data[5]) or is_admin(real_uname)
             
             cur_last = await db.execute("""
                 SELECT text, msg_type, timestamp, is_read, sender_username FROM messages 
@@ -653,7 +777,7 @@ async def get_user_chats(username: str):
                 "last_sender": last_sender,
                 "time": last[2] if last else "",
                 "pinned_id": 0,
-                "is_dev": is_dev(real_uname),
+                "is_dev": adm,
                 "is_blocked": p in blocked_list
             })
 
@@ -669,9 +793,9 @@ async def search(q: str = "", current_user: str = "", offset: int = 0, limit: in
 
     results = []
     async with aiosqlite.connect(DB_PATH) as db:
-        cur_u = await db.execute("SELECT username, display_name, email, avatar_url FROM users")
+        cur_u = await db.execute("SELECT username, display_name, email, avatar_url, is_admin FROM users")
         for r in await cur_u.fetchall():
-            uname, dname, email, avatar = r[0], r[1], r[2], r[3]
+            uname, dname, email, avatar, adm = r[0], r[1], r[2], r[3], bool(r[4]) or is_admin(r[0])
             if cur_uname and uname.lower() == cur_uname:
                 continue
             s1 = calculate_score(clean_q, uname)
@@ -687,7 +811,7 @@ async def search(q: str = "", current_user: str = "", offset: int = 0, limit: in
                     "name": dname,
                     "extra": email,
                     "avatar": avatar or "",
-                    "is_dev": is_dev(uname)
+                    "is_dev": adm
                 })
 
         cur_c = await db.execute("SELECT channel_tag, name, avatar_url, description, creator_username, members FROM channels")
@@ -755,7 +879,7 @@ async def get_history(user: str, target: str):
             creator = c_data[0] if c_data else ""
             members = [m.lower() for m in json.loads(c_data[1] or "[]")] if c_data else []
             desc = c_data[2] if c_data else ""
-            is_member = u_req in members or creator.lower() == u_req or is_dev(u_req)
+            is_member = u_req in members or creator.lower() == u_req or is_admin(u_req)
 
             cur = await db.execute(
                 """SELECT id, sender_username, sender_name, target, text, msg_type, file_url, file_name, 
@@ -787,7 +911,7 @@ async def get_history(user: str, target: str):
                     "is_edited": bool(r[14]),
                     "time": r[16],
                     "avatar": r[17] or "",
-                    "is_dev": is_dev(r[1])
+                    "is_dev": is_admin(r[1])
                 } for r in rows]
             }
         else:
@@ -826,7 +950,7 @@ async def get_history(user: str, target: str):
                     "is_edited": bool(r[14]),
                     "time": r[16],
                     "avatar": r[17] or "",
-                    "is_dev": is_dev(r[1])
+                    "is_dev": is_admin(r[1])
                 } for r in rows]
             }
 
@@ -934,9 +1058,11 @@ HTML_TEMPLATE = """
             padding: 28px 24px;
             border-radius: 20px;
             width: 90%;
-            max-width: 420px;
+            max-width: 480px;
             border: 1px solid var(--card-border);
             box-shadow: 0 25px 50px rgba(0,0,0,0.5);
+            max-height: 85vh;
+            overflow-y: auto;
         }
         .brand-logo {
             display: flex;
@@ -1604,6 +1730,7 @@ HTML_TEMPLATE = """
     </div>
 </div>
 
+<!-- Модалка Просмотра Чужого Профиля -->
 <div id="user-info-modal" class="modal-overlay" style="display: none;">
     <div class="card-modal" style="text-align: center;">
         <h2>Профиль пользователя</h2>
@@ -1611,13 +1738,45 @@ HTML_TEMPLATE = """
         <div style="display:flex; align-items:center; justify-content:center; gap:8px; margin-bottom:4px;">
             <h3 id="info-name" style="color:var(--text-main);"></h3>
             <span id="info-dev-badge" class="dev-badge" style="display:none;">🛠️ DEV</span>
+            <span id="info-admin-badge" class="dev-badge" style="display:none; background:linear-gradient(135deg, #2563eb, #38bdf8);">🛡️ АДМИН</span>
         </div>
         <p id="info-tag" style="color: var(--badge-blue); font-size: 0.9rem; margin-bottom: 6px;"></p>
         <p id="info-status-text" style="font-size: 0.85rem; color: var(--online-green); margin-bottom: 4px;">🟢 В сети</p>
         <p id="info-date" style="color: var(--text-sub); font-size: 0.8rem; margin-bottom: 16px;">Регистрация: ...</p>
         
+        <!-- Кнопка жалобы -->
+        <div id="report-box" style="margin-bottom: 12px; text-align: left;">
+            <input type="text" id="report-reason-input" placeholder="Причина жалобы (например, спам, оскорбления)" style="margin-bottom: 6px;">
+            <button class="btn-primary" style="background: #eab308; color: #000;" onclick="submitReport()">⚠️ Пожаловаться</button>
+        </div>
+
         <button class="btn-primary" id="info-block-btn" style="background:#ef4444;" onclick="toggleBlockContact()">🚫 Заблокировать</button>
         <button class="btn-cancel" onclick="document.getElementById('user-info-modal').style.display='none'">Закрыть</button>
+    </div>
+</div>
+
+<!-- Админ-панель Модалка -->
+<div id="admin-modal" class="modal-overlay" style="display: none;">
+    <div class="card-modal" style="max-width: 700px;">
+        <h2>🛡️ Панель Администратора</h2>
+        <p class="subtitle" id="admin-subtitle">Управление пользователями и жалобами</p>
+        
+        <div style="display: flex; gap: 10px; margin-bottom: 16px;">
+            <button class="btn-primary" style="width: auto; padding: 8px 16px;" onclick="switchAdminTab('users')">👥 Пользователи (<span id="adm-users-count">0</span>)</button>
+            <button class="btn-primary" style="width: auto; padding: 8px 16px; background: #eab308; color:#000;" onclick="switchAdminTab('reports')">⚠️ Жалобы (<span id="adm-reports-count">0</span>)</button>
+        </div>
+
+        <!-- Вкладка пользователей -->
+        <div id="adm-tab-users" style="max-height: 350px; overflow-y: auto;">
+            <div id="adm-users-list"></div>
+        </div>
+
+        <!-- Вкладка жалоб -->
+        <div id="adm-tab-reports" style="max-height: 350px; overflow-y: auto; display: none;">
+            <div id="adm-reports-list"></div>
+        </div>
+
+        <button class="btn-cancel" onclick="document.getElementById('admin-modal').style.display='none'" style="margin-top: 16px;">Закрыть</button>
     </div>
 </div>
 
@@ -1641,11 +1800,13 @@ HTML_TEMPLATE = """
                     <div style="display:flex; align-items:center; gap:6px;">
                         <span id="my-display-name" style="font-weight:600; font-size:0.92rem; color:var(--text-main);">Загрузка...</span>
                         <span id="my-dev-badge" class="dev-badge" style="display:none;">DEV</span>
+                        <span id="my-admin-badge" class="dev-badge" style="display:none; background:linear-gradient(135deg, #2563eb, #38bdf8);">АДМИН</span>
                     </div>
                     <div id="my-tag" style="font-size:0.75rem; color:var(--text-sub);">@...</div>
                 </div>
             </div>
             <div class="sidebar-actions">
+                <button class="icon-btn" id="admin-panel-btn" title="Панель администратора" style="display:none; background: #2563eb; color:#fff;" onclick="openAdminPanel()">🛡️</button>
                 <button class="icon-btn" title="Сменить тему" onclick="toggleTheme()">🌓</button>
                 <button class="icon-btn" title="Создать канал" onclick="document.getElementById('channel-modal').style.display='flex'">➕</button>
             </div>
@@ -1732,6 +1893,7 @@ HTML_TEMPLATE = """
     let editMsg = null;
     let forwardMsg = null;
     let viewingPeerInfo = null;
+    let adminDataCache = null;
 
     let searchQuery = "";
     let searchOffset = 0;
@@ -1915,6 +2077,12 @@ HTML_TEMPLATE = """
         document.getElementById("my-tag").innerText = "@" + user.username;
         renderAvatarEl(document.getElementById("my-avatar-mini"), user.display_name, user.avatar_url);
 
+        if (checkIsDev(user.username) || user.is_admin) {
+            const myAdminBadge = document.getElementById("my-admin-badge");
+            const admBtn = document.getElementById("admin-panel-btn");
+            if (myAdminBadge) myAdminBadge.style.display = "inline-flex";
+            if (admBtn) admBtn.style.display = "flex";
+        }
         if (checkIsDev(user.username)) {
             const myDevBadge = document.getElementById("my-dev-badge");
             if (myDevBadge) myDevBadge.style.display = "inline-flex";
@@ -1925,7 +2093,10 @@ HTML_TEMPLATE = """
 
         ws.onmessage = (e) => {
             const data = JSON.parse(e.data);
-            if (data.type === "online_list") {
+            if (data.type === "banned") {
+                alert("Ваш аккаунт был заблокирован администратором.");
+                logout();
+            } else if (data.type === "online_list") {
                 onlineUsers = data.users || [];
                 if (!document.getElementById("search-input").value.trim()) renderSidebar();
             } else if (data.type === "typing" && data.sender.toLowerCase() === currentTarget.toLowerCase()) {
@@ -2082,6 +2253,15 @@ HTML_TEMPLATE = """
             }
 
             document.getElementById("info-dev-badge").style.display = data.is_dev ? "inline-flex" : "none";
+            document.getElementById("info-admin-badge").style.display = (data.is_admin && !data.is_dev) ? "inline-flex" : "none";
+            
+            const reportBox = document.getElementById("report-box");
+            if (data.username.toLowerCase() === user.username.toLowerCase()) {
+                reportBox.style.display = "none";
+            } else {
+                reportBox.style.display = "block";
+            }
+
             const btn = document.getElementById("info-block-btn");
             btn.innerText = data.is_blocked ? "Разблокировать" : "🚫 Заблокировать";
             btn.style.background = data.is_blocked ? "#22c55e" : "#ef4444";
@@ -2090,9 +2270,127 @@ HTML_TEMPLATE = """
         }
     }
 
+    async function submitReport() {
+        const reasonInput = document.getElementById("report-reason-input");
+        const reason = reasonInput.value.trim();
+        if (!reason) return alert("Укажите причину жалобы");
+        if (!viewingPeerInfo) return;
+
+        const res = await fetch("/api/report", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({ reporter: user.username, reported_user: viewingPeerInfo.username, reason: reason })
+        });
+        const data = await res.json();
+        if (data.status === "ok") {
+            alert("Жалоба успешно отправлена администраторам.");
+            reasonInput.value = "";
+            document.getElementById("user-info-modal").style.display = "none";
+        }
+    }
+
+    async function openAdminPanel() {
+        const res = await fetch(`/api/admin/data?username=${encodeURIComponent(user.username)}`);
+        const data = await res.json();
+        if (data.status !== "ok") {
+            return alert(data.message);
+        }
+        adminDataCache = data;
+        document.getElementById("adm-users-count").innerText = data.users.length;
+        document.getElementById("adm-reports-count").innerText = data.reports.length;
+        
+        renderAdminUsers();
+        renderAdminReports();
+        document.getElementById("admin-modal").style.display = "flex";
+    }
+
+    function switchAdminTab(tab) {
+        if (tab === 'users') {
+            document.getElementById("adm-tab-users").style.display = "block";
+            document.getElementById("adm-tab-reports").style.display = "none";
+        } else {
+            document.getElementById("adm-tab-users").style.display = "none";
+            document.getElementById("adm-tab-reports").style.display = "block";
+        }
+    }
+
+    function renderAdminUsers() {
+        const box = document.getElementById("adm-users-list");
+        box.innerHTML = "";
+        adminDataCache.users.forEach(u => {
+            const div = document.createElement("div");
+            div.className = "chat-item";
+            div.style.borderBottom = "1px solid var(--border-color)";
+            div.style.justifyContent = "space-between";
+            
+            const isMe = u.username.toLowerCase() === user.username.toLowerCase();
+            let actions = "";
+            if (!isMe) {
+                const banBtn = u.is_banned ? 
+                    `<button class="header-sub-btn btn-join" onclick="doAdminAction('${u.username}', 'unban')">Разблокировать</button>` : 
+                    `<button class="header-sub-btn btn-leave" onclick="doAdminAction('${u.username}', 'ban')">Бан</button>`;
+                
+                const admBtn = u.is_admin ? 
+                    `<button class="header-sub-btn btn-leave" onclick="doAdminAction('${u.username}', 'remove_admin')">Снять админа</button>` : 
+                    `<button class="header-sub-btn btn-join" onclick="doAdminAction('${u.username}', 'make_admin')">Сделать админом</button>`;
+                
+                actions = `<div style="display:flex; gap:6px;">${admBtn} ${banBtn}</div>`;
+            } else {
+                actions = `<span style="font-size:0.75rem; color:var(--text-sub);">Это вы</span>`;
+            }
+
+            div.innerHTML = `
+                <div>
+                    <div style="font-weight:bold; color:var(--text-main);">${u.display_name} (@${u.username}) ${u.is_online ? '🟢 Онлайн' : '⚪ Офлайн'}</div>
+                    <div style="font-size:0.75rem; color:var(--text-sub);">${u.email} | Статус: ${u.custom_status}</div>
+                </div>
+                ${actions}
+            `;
+            box.appendChild(div);
+        });
+    }
+
+    function renderAdminReports() {
+        const box = document.getElementById("adm-reports-list");
+        box.innerHTML = "";
+        if (adminDataCache.reports.length === 0) {
+            box.innerHTML = `<div style="padding: 20px; text-align:center; color:var(--text-sub);">Жалоб нет</div>`;
+            return;
+        }
+        adminDataCache.reports.forEach(r => {
+            const div = document.createElement("div");
+            div.className = "chat-item";
+            div.style.borderBottom = "1px solid var(--border-color)";
+            div.style.justifyContent = "space-between";
+            div.innerHTML = `
+                <div>
+                    <div style="font-weight:bold; color:#ef4444;">На игрока: @${r.reported_user}</div>
+                    <div style="font-size:0.85rem; color:var(--text-main); margin-top:2px;">Причина: ${r.reason}</div>
+                    <div style="font-size:0.75rem; color:var(--text-sub); margin-top:2px;">Отправил: @${r.reporter} (${r.timestamp})</div>
+                </div>
+                <button class="header-sub-btn btn-leave" onclick="doAdminAction('', 'delete_report', ${r.id})">Удалить жалобу</button>
+            `;
+            box.appendChild(div);
+        });
+    }
+
+    async function doAdminAction(targetUser, actionType, reportId = 0) {
+        const res = await fetch("/api/admin/action", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({ admin_username: user.username, target_username: targetUser, action: actionType, report_id: reportId })
+        });
+        const data = await res.json();
+        if (data.status === "ok") {
+            openAdminPanel();
+        } else {
+            alert(data.message);
+        }
+    }
+
     function openChannelSettings() {
         const chat = chatsList.find(c => c.key.toLowerCase() === currentTarget.toLowerCase());
-        const isOwner = (currentChannelData && currentChannelData.creator.toLowerCase() === user.username.toLowerCase()) || is_dev(user.username);
+        const isOwner = (currentChannelData && currentChannelData.creator.toLowerCase() === user.username.toLowerCase()) || checkIsDev(user.username) || user.is_admin;
         if (!isOwner) return;
 
         document.getElementById("edit-chan-name").value = chat ? chat.name : "";
@@ -2313,7 +2611,7 @@ HTML_TEMPLATE = """
 
         chatsList.forEach(chat => {
             const isOnline = onlineUsers.includes(chat.key.toLowerCase());
-            const isPeerDev = checkIsDev(chat.key);
+            const isPeerDev = checkIsDev(chat.key) || chat.is_dev;
             const isDnd = chat.custom_status === "dnd";
             const isInv = chat.custom_status === "offline";
 
@@ -2381,7 +2679,7 @@ HTML_TEMPLATE = """
         let chat = chatsList.find(c => c.key.toLowerCase() === key.toLowerCase());
         const name = chat ? chat.name : key;
         const avatar = chat ? chat.avatar : "";
-        const isPeerDev = checkIsDev(key);
+        const isPeerDev = checkIsDev(key) || (chat && chat.is_dev);
 
         document.getElementById("header-title").innerText = name;
         document.getElementById("header-dev-badge").style.display = isPeerDev ? "inline-flex" : "none";
@@ -2412,7 +2710,7 @@ HTML_TEMPLATE = """
 
             if (isChannel) {
                 currentChannelData = data;
-                const isOwner = (data.creator.toLowerCase() === user.username.toLowerCase()) || is_dev(user.username);
+                const isOwner = (data.creator.toLowerCase() === user.username.toLowerCase()) || checkIsDev(user.username) || user.is_admin;
                 
                 settingsBtn.style.display = isOwner ? "flex" : "none";
                 subBtn.style.display = "block";
@@ -2482,7 +2780,7 @@ HTML_TEMPLATE = """
                 reactionsHtml += `</div>`;
             }
 
-            const isMsgDev = checkIsDev(m.sender_username);
+            const isMsgDev = checkIsDev(m.sender_username) || m.is_dev;
             let checkIcon = "";
             if (isMine && !currentTarget.startsWith("#")) {
                 checkIcon = m.is_read ? '<span class="read-status">✓✓</span>' : '<span style="opacity:0.6;">✓</span>';
@@ -2763,6 +3061,17 @@ async def get_client():
 @app.websocket("/ws/{username}")
 async def ws_endpoint(websocket: WebSocket, username: str):
     uname = username.strip().lower()
+    
+    # Проверка перед подключением: забанен ли пользователь
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT is_banned FROM users WHERE LOWER(username) = LOWER(?)", (uname,))
+        row = await cur.fetchone()
+        if row and row[0] == 1:
+            await websocket.accept()
+            await websocket.send_text(json.dumps({"type": "banned"}))
+            await websocket.close()
+            return
+
     await manager.connect(uname, websocket)
     try:
         while True:
@@ -2861,7 +3170,7 @@ async def ws_endpoint(websocket: WebSocket, username: str):
                 async with aiosqlite.connect(DB_PATH) as db:
                     cur_c = await db.execute("SELECT creator_username FROM channels WHERE LOWER(channel_tag) = LOWER(?)", (clean_tag,))
                     c_row = await cur_c.fetchone()
-                    if not c_row or (c_row[0].lower() != uname and not is_dev(uname)):
+                    if not c_row or (c_row[0].lower() != uname and not is_admin(uname)):
                         continue
 
             async with aiosqlite.connect(DB_PATH) as db:
@@ -2894,7 +3203,7 @@ async def ws_endpoint(websocket: WebSocket, username: str):
                 "is_edited": False,
                 "time": time_str,
                 "avatar": data.get("avatar", ""),
-                "is_dev": is_dev(uname)
+                "is_dev": is_admin(uname)
             }
 
             if target.startswith("#"):
