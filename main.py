@@ -12,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
 
-app = FastAPI(title="Cloud Messenger Pro")
+app = FastAPI(title="Cipher Messenger")
 
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -27,6 +27,11 @@ app.add_middleware(
 )
 
 DB_PATH = "messenger.db"
+
+DEV_USERNAMES = ["milesconxxwow", "miles"]
+
+def is_dev(username: str) -> bool:
+    return username.lower().strip().lstrip("@") in DEV_USERNAMES
 
 def hash_password(password: str) -> str:
     return hashlib.sha256(password.encode("utf-8")).hexdigest()
@@ -95,7 +100,7 @@ class ConnectionManager:
         if recipient_username in self.active_connections:
             await self.active_connections[recipient_username].send_text(json.dumps(message))
 
-    async def broadcast(self, message: dict, sender_username: str = None):
+    async def broadcast_channel(self, message: dict, sender_username: str = None):
         for uname, conn in self.active_connections.items():
             if uname != sender_username:
                 try:
@@ -150,7 +155,8 @@ async def register(data: RegisterModel):
             "username": uname,
             "display_name": name,
             "email": email,
-            "avatar_url": ""
+            "avatar_url": "",
+            "is_dev": is_dev(uname)
         }
 
 @app.post("/api/login")
@@ -172,7 +178,8 @@ async def login(data: LoginModel):
                 "username": user[0],
                 "display_name": user[1],
                 "email": user[2],
-                "avatar_url": user[3] or ""
+                "avatar_url": user[3] or "",
+                "is_dev": is_dev(user[0])
             }
         return {"status": "error", "message": "Неверный логин или пароль"}
 
@@ -225,21 +232,8 @@ async def create_channel(tag: str = Form(...), name: str = Form(...), desc: str 
 
 @app.get("/api/chats")
 async def get_user_chats(username: str):
-    """Возвращает все сохраненные диалоги пользователя и каналы"""
     async with aiosqlite.connect(DB_PATH) as db:
         chats = []
-        # Общий чат
-        cur_gen = await db.execute("SELECT text, timestamp FROM messages WHERE target = 'Общий чат' ORDER BY id DESC LIMIT 1")
-        last_gen = await cur_gen.fetchone()
-        chats.append({
-            "key": "Общий чат",
-            "name": "Общий чат",
-            "tag": "Общий чат",
-            "type": "channel",
-            "avatar": "",
-            "last_msg": last_gen[0] if last_gen else "Публичный канал связи",
-            "time": last_gen[1] if last_gen else ""
-        })
 
         # Все каналы
         cur_ch = await db.execute("SELECT channel_tag, name, avatar_url FROM channels")
@@ -253,8 +247,9 @@ async def get_user_chats(username: str):
                 "tag": tag_key,
                 "type": "channel",
                 "avatar": ch[2] or "",
-                "last_msg": last[0] if last else "Канал",
-                "time": last[1] if last else ""
+                "last_msg": last[0] if last else "Канал создан",
+                "time": last[1] if last else "",
+                "is_dev": False
             })
 
         # Все собеседники из сообщений
@@ -263,11 +258,10 @@ async def get_user_chats(username: str):
                 CASE WHEN sender_username = ? THEN target ELSE sender_username END AS peer
             FROM messages 
             WHERE (sender_username = ? OR target = ?) 
-              AND target != 'Общий чат' 
               AND target NOT LIKE '#%'
         """, (username, username, username))
         
-        peers = [r[0] for r in await cur_peers.fetchall() if r[0] != username]
+        peers = [r[0] for r in await cur_peers.fetchall() if r[0] != username and not r[0].startswith("#")]
 
         for p in peers:
             cur_u = await db.execute("SELECT display_name, avatar_url FROM users WHERE username = ?", (p,))
@@ -289,7 +283,8 @@ async def get_user_chats(username: str):
                 "type": "user",
                 "avatar": avatar,
                 "last_msg": last[0] if last else "",
-                "time": last[1] if last else ""
+                "time": last[1] if last else "",
+                "is_dev": is_dev(p)
             })
 
         return {"chats": chats}
@@ -302,20 +297,35 @@ async def search(q: str):
             "SELECT username, display_name, avatar_url FROM users WHERE username LIKE ? OR display_name LIKE ? LIMIT 10",
             (query, query)
         )
-        users = [{"type": "user", "key": r[0], "tag": f"@{r[0]}", "name": r[1], "avatar": r[2]} for r in await cur_u.fetchall()]
+        users = [{
+            "type": "user", 
+            "key": r[0], 
+            "tag": f"@{r[0]}", 
+            "name": r[1], 
+            "avatar": r[2],
+            "is_dev": is_dev(r[0])
+        } for r in await cur_u.fetchall()]
 
         cur_c = await db.execute(
             "SELECT channel_tag, name, avatar_url, description FROM channels WHERE channel_tag LIKE ? OR name LIKE ? LIMIT 10",
             (query, query)
         )
-        channels = [{"type": "channel", "key": f"#{r[0]}", "tag": f"#{r[0]}", "name": r[1], "avatar": r[2], "desc": r[3]} for r in await cur_c.fetchall()]
+        channels = [{
+            "type": "channel", 
+            "key": f"#{r[0]}", 
+            "tag": f"#{r[0]}", 
+            "name": r[1], 
+            "avatar": r[2], 
+            "desc": r[3],
+            "is_dev": False
+        } for r in await cur_c.fetchall()]
 
         return {"results": users + channels}
 
 @app.get("/api/history")
 async def get_history(user: str, target: str):
     async with aiosqlite.connect(DB_PATH) as db:
-        if target.startswith("#") or target == "Общий чат":
+        if target.startswith("#"):
             cur = await db.execute(
                 """SELECT sender_username, sender_name, target, text, timestamp, avatar_url 
                    FROM messages WHERE target = ? ORDER BY id ASC LIMIT 200""",
@@ -336,7 +346,8 @@ async def get_history(user: str, target: str):
             "target": r[2],
             "text": r[3],
             "time": r[4],
-            "avatar": r[5]
+            "avatar": r[5],
+            "is_dev": is_dev(r[0])
         } for r in rows]
 
 HTML_TEMPLATE = """
@@ -345,22 +356,22 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Cloud Messenger Pro</title>
+    <title>Cipher Messenger</title>
     <style>
         :root {
-            --bg-main: #0e1015;
-            --bg-sidebar: #13151b;
-            --bg-sidebar-hover: #1c1f28;
-            --bg-chat: #0e1015;
-            --bg-header: #13151b;
-            --bg-input: #181b22;
-            --bubble-in: #1f222c;
-            --bubble-out: #2b77f7;
+            --bg-main: #0b0d13;
+            --bg-sidebar: #10131c;
+            --bg-sidebar-hover: #171b26;
+            --bg-chat: #0b0d13;
+            --bg-header: #10131c;
+            --bg-input: #151822;
+            --bubble-in: #191d29;
+            --bubble-out: #2563eb;
             --text-main: #ffffff;
-            --text-sub: #7a8293;
-            --badge-blue: #2b77f7;
-            --online-green: #22c55e;
-            --border-color: #1c202a;
+            --text-sub: #717a8c;
+            --badge-blue: #3b82f6;
+            --online-green: #10b981;
+            --border-color: #171b26;
             --danger-red: #ef4444;
         }
 
@@ -379,34 +390,63 @@ HTML_TEMPLATE = """
             overflow: hidden;
         }
 
+        /* Бейдж разработчика */
+        .dev-badge {
+            background: linear-gradient(135deg, #8b5cf6, #ec4899);
+            color: #fff;
+            font-size: 0.65rem;
+            font-weight: 800;
+            padding: 2px 7px;
+            border-radius: 6px;
+            letter-spacing: 0.5px;
+            display: inline-flex;
+            align-items: center;
+            gap: 3px;
+            box-shadow: 0 0 10px rgba(236, 72, 153, 0.35);
+            text-transform: uppercase;
+            vertical-align: middle;
+        }
+
         .modal-overlay {
             position: fixed;
             inset: 0;
-            background: rgba(8, 10, 14, 0.94);
-            backdrop-filter: blur(8px);
+            background: rgba(6, 8, 12, 0.94);
+            backdrop-filter: blur(10px);
             display: flex;
             align-items: center;
             justify-content: center;
             z-index: 1000;
         }
         .card-modal {
-            background: #161821;
-            padding: 28px 24px;
-            border-radius: 18px;
+            background: #121520;
+            padding: 30px 26px;
+            border-radius: 20px;
             width: 90%;
             max-width: 400px;
-            border: 1px solid #232734;
-            box-shadow: 0 20px 40px rgba(0,0,0,0.6);
+            border: 1px solid #1e2332;
+            box-shadow: 0 25px 50px rgba(0,0,0,0.7);
         }
-        .card-modal h2 { font-size: 1.35rem; font-weight: 700; margin-bottom: 6px; text-align: center; }
-        .card-modal p.subtitle { font-size: 0.85rem; color: var(--text-sub); margin-bottom: 18px; text-align: center; }
+        .brand-logo {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            font-size: 1.6rem;
+            font-weight: 800;
+            letter-spacing: 1px;
+            color: #fff;
+            margin-bottom: 4px;
+        }
+        .brand-logo span { color: var(--badge-blue); }
+        .card-modal h2 { font-size: 1.3rem; font-weight: 700; margin-bottom: 4px; text-align: center; }
+        .card-modal p.subtitle { font-size: 0.85rem; color: var(--text-sub); margin-bottom: 20px; text-align: center; }
         
         .card-modal input, .card-modal textarea {
             width: 100%;
             padding: 12px 14px;
             margin-bottom: 12px;
             background: var(--bg-input);
-            border: 1px solid #262b3a;
+            border: 1px solid #202636;
             color: #fff;
             border-radius: 12px;
             outline: none;
@@ -426,6 +466,7 @@ HTML_TEMPLATE = """
             cursor: pointer;
             margin-top: 6px;
         }
+        .btn-primary:hover { opacity: 0.9; }
         .btn-cancel {
             background: transparent;
             color: var(--text-sub);
@@ -465,20 +506,20 @@ HTML_TEMPLATE = """
             gap: 10px;
             cursor: pointer;
             padding: 4px 8px;
-            border-radius: 10px;
+            border-radius: 12px;
             transition: background 0.2s;
         }
-        .user-profile-badge:hover { background: #1c202a; }
+        .user-profile-badge:hover { background: #171b26; }
         .avatar-small {
-            width: 36px;
-            height: 36px;
+            width: 38px;
+            height: 38px;
             border-radius: 50%;
             object-fit: cover;
             display: flex;
             align-items: center;
             justify-content: center;
             font-weight: bold;
-            font-size: 0.9rem;
+            font-size: 0.92rem;
             color: #fff;
             flex-shrink: 0;
         }
@@ -489,11 +530,11 @@ HTML_TEMPLATE = """
         }
         .icon-btn {
             background: var(--bg-input);
-            border: 1px solid #232734;
+            border: 1px solid #1e2332;
             color: #fff;
-            width: 36px;
-            height: 36px;
-            border-radius: 10px;
+            width: 38px;
+            height: 38px;
+            border-radius: 12px;
             display: flex;
             align-items: center;
             justify-content: center;
@@ -501,7 +542,7 @@ HTML_TEMPLATE = """
             font-size: 1.1rem;
             transition: 0.2s;
         }
-        .icon-btn:hover { background: #262b3a; }
+        .icon-btn:hover { background: #202636; }
 
         .search-container {
             padding: 8px 16px 14px 16px;
@@ -510,9 +551,9 @@ HTML_TEMPLATE = """
         }
         .search-input {
             width: 100%;
-            padding: 10px 14px 10px 36px;
+            padding: 11px 14px 11px 36px;
             background: var(--bg-input);
-            border: 1px solid #232734;
+            border: 1px solid #1e2332;
             border-radius: 12px;
             color: #fff;
             outline: none;
@@ -521,7 +562,7 @@ HTML_TEMPLATE = """
         .search-icon {
             position: absolute;
             left: 28px;
-            top: 19px;
+            top: 20px;
             font-size: 0.85rem;
             color: var(--text-sub);
         }
@@ -538,7 +579,7 @@ HTML_TEMPLATE = """
             transition: background 0.15s;
         }
         .chat-item:hover { background: var(--bg-sidebar-hover); }
-        .chat-item.active { background: #1c202c; }
+        .chat-item.active { background: #171b28; }
 
         .avatar-wrap {
             position: relative;
@@ -578,7 +619,7 @@ HTML_TEMPLATE = """
         .chat-top-row {
             display: flex;
             justify-content: space-between;
-            align-items: baseline;
+            align-items: center;
             margin-bottom: 3px;
         }
         .chat-name {
@@ -588,6 +629,9 @@ HTML_TEMPLATE = """
             white-space: nowrap;
             overflow: hidden;
             text-overflow: ellipsis;
+            display: flex;
+            align-items: center;
+            gap: 6px;
         }
         .chat-time {
             font-size: 0.72rem;
@@ -613,6 +657,18 @@ HTML_TEMPLATE = """
             flex-direction: column;
             background: var(--bg-chat);
             height: 100%;
+        }
+
+        .empty-placeholder {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            color: var(--text-sub);
+            gap: 12px;
+            text-align: center;
+            padding: 20px;
         }
 
         .chat-header {
@@ -681,7 +737,10 @@ HTML_TEMPLATE = """
             font-size: 0.76rem;
             font-weight: 600;
             color: #60a5fa;
-            margin-bottom: 3px;
+            margin-bottom: 4px;
+            display: flex;
+            align-items: center;
+            gap: 6px;
         }
         .bubble-footer {
             display: flex;
@@ -704,7 +763,7 @@ HTML_TEMPLATE = """
         .input-wrapper {
             flex: 1;
             background: var(--bg-input);
-            border: 1px solid #232734;
+            border: 1px solid #1e2332;
             border-radius: 12px;
             padding: 0 14px;
             display: flex;
@@ -744,16 +803,16 @@ HTML_TEMPLATE = """
 
 <div id="auth-modal" class="modal-overlay">
     <div class="card-modal">
-        <h2 id="auth-title">Вход</h2>
-        <p class="subtitle" id="auth-sub">Войдите в свой аккаунт</p>
+        <div class="brand-logo">⚡ CIPHER<span>.</span></div>
+        <p class="subtitle" id="auth-sub">Secure Cloud Network</p>
         
         <input type="text" id="auth-login" placeholder="Email или @юзернейм">
-        <input type="text" id="auth-name" placeholder="Отображаемое имя" style="display:none;">
+        <input type="text" id="auth-name" placeholder="Отображаемое имя (например, Miles)" style="display:none;">
         <input type="text" id="auth-username" placeholder="Уникальный @юзернейм" style="display:none;">
         <input type="password" id="auth-pwd" placeholder="Пароль">
         
-        <button class="btn-primary" onclick="submitAuth()" id="auth-btn">Войти</button>
-        <p class="subtitle" style="margin-top: 15px; cursor: pointer; color: var(--badge-blue);" id="auth-toggle" onclick="toggleAuth()">Нет аккаунта? Создать</p>
+        <button class="btn-primary" onclick="submitAuth()" id="auth-btn">Войти в Cipher</button>
+        <p class="subtitle" style="margin-top: 15px; cursor: pointer; color: var(--badge-blue);" id="auth-toggle" onclick="toggleAuth()">Нет аккаунта? Создать аккаунт</p>
     </div>
 </div>
 
@@ -763,12 +822,12 @@ HTML_TEMPLATE = """
         <p class="subtitle">Публичное пространство для постов и общения</p>
         
         <input type="text" id="chan-name" placeholder="Название канала">
-        <input type="text" id="chan-tag" placeholder="Тег (например, news, dev)">
+        <input type="text" id="chan-tag" placeholder="Тег канала (например, dev, music)">
         <textarea id="chan-desc" rows="2" placeholder="Описание канала..."></textarea>
         <label style="font-size: 0.8rem; color: var(--text-sub); display: block; margin-bottom: 6px;">Аватарка канала:</label>
         <input type="file" id="chan-file" accept="image/*">
 
-        <button class="btn-primary" onclick="createChannelSubmit()">Создать</button>
+        <button class="btn-primary" onclick="createChannelSubmit()">Создать канал</button>
         <button class="btn-cancel" onclick="document.getElementById('channel-modal').style.display='none'">Отмена</button>
     </div>
 </div>
@@ -777,13 +836,16 @@ HTML_TEMPLATE = """
     <div class="card-modal" style="text-align: center;">
         <h2>Мой профиль</h2>
         <div id="profile-avatar-preview" style="width: 80px; height: 80px; border-radius: 50%; margin: 15px auto; display:flex; align-items:center; justify-content:center; font-size:2rem; font-weight:bold; color:#fff; overflow:hidden;"></div>
-        <h3 id="profile-name" style="margin-bottom: 2px;"></h3>
+        <div style="display:flex; align-items:center; justify-content:center; gap:8px; margin-bottom:4px;">
+            <h3 id="profile-name"></h3>
+            <span id="profile-dev-badge" class="dev-badge" style="display:none;">🛠️ Разработчик</span>
+        </div>
         <p id="profile-tag" style="color: var(--badge-blue); font-size: 0.9rem; margin-bottom: 15px;"></p>
         
-        <label style="font-size: 0.85rem; color: var(--text-sub); display: block; margin-bottom: 8px;">Сменить аватарку:</label>
+        <label style="font-size: 0.85rem; color: var(--text-sub); display: block; margin-bottom: 8px;">Сменить фото:</label>
         <input type="file" id="profile-file" accept="image/*">
         
-        <button class="btn-primary" onclick="uploadUserAvatar()">Сохранить фото</button>
+        <button class="btn-primary" onclick="uploadUserAvatar()">Сохранить аватарку</button>
         <button class="btn-cancel" onclick="logout()" style="color: var(--danger-red); margin-top: 8px;">Выйти из аккаунта 🚪</button>
         <button class="btn-cancel" onclick="document.getElementById('profile-modal').style.display='none'">Закрыть</button>
     </div>
@@ -795,7 +857,10 @@ HTML_TEMPLATE = """
             <div class="user-profile-badge" onclick="openProfile()">
                 <div class="avatar-small" id="my-avatar-mini">?</div>
                 <div>
-                    <div id="my-display-name" style="font-weight:600; font-size:0.92rem;">Загрузка...</div>
+                    <div style="display:flex; align-items:center; gap:6px;">
+                        <span id="my-display-name" style="font-weight:600; font-size:0.92rem;">Загрузка...</span>
+                        <span id="my-dev-badge" class="dev-badge" style="display:none;">DEV</span>
+                    </div>
                     <div id="my-tag" style="font-size:0.75rem; color:var(--text-sub);">@...</div>
                 </div>
             </div>
@@ -813,33 +878,49 @@ HTML_TEMPLATE = """
     </div>
 
     <div id="chat-area">
-        <div class="chat-header">
-            <button class="back-btn" onclick="document.body.classList.remove('in-chat')">←</button>
-            <div class="avatar-small" id="header-avatar" style="width:42px; height:42px; font-size:1.1rem; margin-right:12px;">?</div>
-            <div>
-                <div id="header-title" style="font-weight:600; font-size:1rem;">Выберите чат</div>
-                <div id="header-sub" style="font-size:0.78rem; color:var(--badge-blue);">онлайн</div>
-            </div>
+        <div id="chat-placeholder" class="empty-placeholder">
+            <div style="font-size: 3rem;">⚡</div>
+            <h3 style="color:#fff;">Добро пожаловать в Cipher</h3>
+            <p>Выберите чат слева или воспользуйтесь поиском, чтобы начать диалог</p>
         </div>
 
-        <div class="messages-container" id="messages"></div>
-
-        <div class="input-bar">
-            <div class="input-wrapper">
-                <input type="text" id="msg-input" placeholder="Напишите сообщение..." onkeydown="if(event.key==='Enter') sendMsg()">
+        <div id="chat-content" style="display:none; flex-direction:column; height:100%;">
+            <div class="chat-header">
+                <button class="back-btn" onclick="document.body.classList.remove('in-chat')">←</button>
+                <div class="avatar-small" id="header-avatar" style="width:42px; height:42px; font-size:1.1rem; margin-right:12px;">?</div>
+                <div>
+                    <div style="display:flex; align-items:center; gap:6px;">
+                        <span id="header-title" style="font-weight:600; font-size:1rem;">Выберите чат</span>
+                        <span id="header-dev-badge" class="dev-badge" style="display:none;">DEV</span>
+                    </div>
+                    <div id="header-sub" style="font-size:0.78rem; color:var(--badge-blue);">Cipher Network</div>
+                </div>
             </div>
-            <button class="send-btn" onclick="sendMsg()">➤</button>
+
+            <div class="messages-container" id="messages"></div>
+
+            <div class="input-bar">
+                <div class="input-wrapper">
+                    <input type="text" id="msg-input" placeholder="Напишите сообщение в Cipher..." onkeydown="if(event.key==='Enter') sendMsg()">
+                </div>
+                <button class="send-btn" onclick="sendMsg()">➤</button>
+            </div>
         </div>
     </div>
 </div>
 
 <script>
     let user = JSON.parse(localStorage.getItem("messenger_user") || "null");
-    let currentTarget = localStorage.getItem("messenger_target") || "Общий чат";
+    let currentTarget = localStorage.getItem("messenger_target") || "";
     let isRegister = false;
     let ws = null;
     let chatsList = [];
     let onlineUsers = [];
+
+    const DEV_USERS = ["milesconxxwow", "miles"];
+    function checkIsDev(uname) {
+        return uname && DEV_USERS.includes(uname.toLowerCase().replace("@", ""));
+    }
 
     const gradients = [
         "linear-gradient(135deg, #f59e0b, #d97706)",
@@ -876,9 +957,8 @@ HTML_TEMPLATE = """
         isRegister = !isRegister;
         document.getElementById("auth-name").style.display = isRegister ? "block" : "none";
         document.getElementById("auth-username").style.display = isRegister ? "block" : "none";
-        document.getElementById("auth-title").innerText = isRegister ? "Регистрация" : "Вход";
-        document.getElementById("auth-btn").innerText = isRegister ? "Создать аккаунт" : "Войти";
-        document.getElementById("auth-toggle").innerText = isRegister ? "Уже есть аккаунт? Войти" : "Нет аккаунта? Создать";
+        document.getElementById("auth-btn").innerText = isRegister ? "Зарегистрироваться в Cipher" : "Войти в Cipher";
+        document.getElementById("auth-toggle").innerText = isRegister ? "Уже есть аккаунт? Войти" : "Нет аккаунта? Создать аккаунт";
     }
 
     async function submitAuth() {
@@ -937,6 +1017,11 @@ HTML_TEMPLATE = """
         document.getElementById("my-tag").innerText = "@" + user.username;
         renderAvatarEl(document.getElementById("my-avatar-mini"), user.display_name, user.avatar_url);
 
+        if (checkIsDev(user.username)) {
+            document.getElementById("my-dev-badge").style.display = "inline-flex";
+            document.getElementById("profile-dev-badge").style.display = "inline-flex";
+        }
+
         const protocol = location.protocol === "https:" ? "wss:" : "ws:";
         ws = new WebSocket(`${protocol}//${location.host}/ws/${encodeURIComponent(user.username)}`);
 
@@ -946,7 +1031,7 @@ HTML_TEMPLATE = """
                 onlineUsers = data.users;
                 renderSidebar();
             } else if (data.type === "msg") {
-                const isGroup = data.target === "Общий чат" || data.target.startsWith("#");
+                const isGroup = data.target.startsWith("#");
                 const chatKey = isGroup ? data.target : data.sender_username;
                 
                 if (currentTarget === chatKey || (isGroup && currentTarget === data.target)) {
@@ -957,7 +1042,11 @@ HTML_TEMPLATE = """
         };
 
         fetchUserChats().then(() => {
-            selectChat(currentTarget);
+            if (currentTarget && currentTarget !== "Общий чат") {
+                selectChat(currentTarget);
+            } else if (chatsList.length > 0) {
+                selectChat(chatsList[0].key);
+            }
         });
     }
 
@@ -965,6 +1054,10 @@ HTML_TEMPLATE = """
         document.getElementById("profile-name").innerText = user.display_name;
         document.getElementById("profile-tag").innerText = "@" + user.username;
         renderAvatarEl(document.getElementById("profile-avatar-preview"), user.display_name, user.avatar_url);
+        
+        if (checkIsDev(user.username)) {
+            document.getElementById("profile-dev-badge").style.display = "inline-flex";
+        }
         document.getElementById("profile-modal").style.display = "flex";
     }
 
@@ -1024,9 +1117,14 @@ HTML_TEMPLATE = """
     function renderSearchResults(results) {
         const list = document.getElementById("chat-list");
         list.innerHTML = `<div style="padding:10px 18px; font-size:0.75rem; color:var(--text-sub);">РЕЗУЛЬТАТЫ ПОИСКА</div>`;
+        if (results.length === 0) {
+            list.innerHTML += `<div style="padding:18px; text-align:center; color:var(--text-sub); font-size:0.85rem;">Ничего не найдено</div>`;
+            return;
+        }
         results.forEach(item => {
             const div = document.createElement("div");
             div.className = "chat-item";
+            const isUserDev = checkIsDev(item.key);
             div.onclick = () => {
                 const exists = chatsList.find(c => c.key === item.key);
                 if (!exists) {
@@ -1037,7 +1135,8 @@ HTML_TEMPLATE = """
                         type: item.type,
                         avatar: item.avatar,
                         last_msg: item.desc || "Новый диалог",
-                        time: ""
+                        time: "",
+                        is_dev: isUserDev
                     });
                 }
                 selectChat(item.key);
@@ -1048,7 +1147,11 @@ HTML_TEMPLATE = """
                     <div class="avatar-img" style="background:${getGradient(item.name)}">${item.avatar ? `<img src="${item.avatar}" style="width:100%;height:100%;border-radius:50%;object-fit:cover;">` : item.name[0].toUpperCase()}</div>
                 </div>
                 <div class="chat-details">
-                    <div class="chat-name">${item.name} <span style="font-size:0.8rem; color:var(--badge-blue); font-weight:normal;">${item.tag}</span></div>
+                    <div class="chat-name">
+                        <span>${item.name}</span>
+                        ${isUserDev ? '<span class="dev-badge">DEV</span>' : ''}
+                        <span style="font-size:0.78rem; color:var(--badge-blue); font-weight:normal;">${item.tag}</span>
+                    </div>
                     <div class="chat-preview">${item.desc || (item.type === 'user' ? 'Пользователь' : 'Канал')}</div>
                 </div>
             `;
@@ -1059,8 +1162,15 @@ HTML_TEMPLATE = """
     function renderSidebar() {
         const list = document.getElementById("chat-list");
         list.innerHTML = "";
+        
+        if (chatsList.length === 0) {
+            list.innerHTML = `<div style="padding:30px 20px; text-align:center; color:var(--text-sub); font-size:0.85rem;">Нет активных чатов.<br>Используйте поиск 🔍 или создайте канал ➕</div>`;
+            return;
+        }
+
         chatsList.forEach(chat => {
             const isOnline = onlineUsers.includes(chat.key);
+            const isPeerDev = checkIsDev(chat.key);
             const div = document.createElement("div");
             div.className = `chat-item ${currentTarget === chat.key ? 'active' : ''}`;
             div.onclick = () => selectChat(chat.key);
@@ -1072,7 +1182,10 @@ HTML_TEMPLATE = """
                 </div>
                 <div class="chat-details">
                     <div class="chat-top-row">
-                        <div class="chat-name">${chat.name}</div>
+                        <div class="chat-name">
+                            <span>${chat.name}</span>
+                            ${isPeerDev ? '<span class="dev-badge">DEV</span>' : ''}
+                        </div>
                         <div class="chat-time">${chat.time || ''}</div>
                     </div>
                     <div class="chat-bottom-row">
@@ -1085,16 +1198,22 @@ HTML_TEMPLATE = """
     }
 
     async function selectChat(key) {
+        if (!key) return;
         currentTarget = key;
         localStorage.setItem("messenger_target", key);
+
+        document.getElementById("chat-placeholder").style.display = "none";
+        document.getElementById("chat-content").style.display = "flex";
         
         let chat = chatsList.find(c => c.key === key);
         const name = chat ? chat.name : key;
         const tag = chat ? chat.tag : key;
         const avatar = chat ? chat.avatar : "";
+        const isPeerDev = checkIsDev(key);
 
         document.getElementById("header-title").innerText = name;
-        document.getElementById("header-sub").innerText = key.startsWith("#") ? "Канал" : (key === "Общий чат" ? "Общая комната" : tag);
+        document.getElementById("header-sub").innerText = key.startsWith("#") ? "Канал" : tag;
+        document.getElementById("header-dev-badge").style.display = isPeerDev ? "inline-flex" : "none";
         renderAvatarEl(document.getElementById("header-avatar"), name, avatar);
 
         document.body.classList.add("in-chat");
@@ -1112,11 +1231,17 @@ HTML_TEMPLATE = """
         const box = document.getElementById("messages");
         const row = document.createElement("div");
         row.className = `msg-row ${isMine ? 'mine' : 'theirs'}`;
+        const isMsgDev = checkIsDev(m.sender_username);
 
         row.innerHTML = `
             ${!isMine && m.avatar ? `<img src="${m.avatar}" class="msg-avatar">` : ''}
             <div class="bubble">
-                ${!isMine ? `<div class="bubble-header">${m.sender_name} <span style="font-weight:normal; opacity:0.7;">@${m.sender_username}</span></div>` : ''}
+                ${!isMine ? `
+                    <div class="bubble-header">
+                        <span>${m.sender_name}</span>
+                        ${isMsgDev ? '<span class="dev-badge">DEV</span>' : ''}
+                        <span style="font-weight:normal; opacity:0.6; font-size:0.7rem;">@${m.sender_username}</span>
+                    </div>` : ''}
                 <div>${escapeHtml(m.text)}</div>
                 <div class="bubble-footer"><span class="bubble-time">${m.time}</span></div>
             </div>
@@ -1128,7 +1253,7 @@ HTML_TEMPLATE = """
     function sendMsg() {
         const input = document.getElementById("msg-input");
         const text = input.value.trim();
-        if (!text || !ws) return;
+        if (!text || !ws || !currentTarget) return;
 
         const timeStr = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
         const payload = {
@@ -1184,11 +1309,12 @@ async def ws_endpoint(websocket: WebSocket, username: str):
                 "target": target,
                 "text": text,
                 "time": time_str,
-                "avatar": data.get("avatar", "")
+                "avatar": data.get("avatar", ""),
+                "is_dev": is_dev(username)
             }
 
-            if target == "Общий чат" or target.startswith("#"):
-                await manager.broadcast(msg_out, sender_username=username)
+            if target.startswith("#"):
+                await manager.broadcast_channel(msg_out, sender_username=username)
             else:
                 await manager.send_to_user(msg_out, recipient_username=target)
 
