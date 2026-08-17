@@ -6,7 +6,7 @@ import hashlib
 import aiosqlite
 from datetime import datetime
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form
-from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -390,15 +390,46 @@ async def get_user_chats(username: str):
 
 @app.get("/api/search")
 async def search(q: str):
-    query = f"%{q.strip().lstrip('@').lstrip('#').lower()}%"
+    """Полнотекстовый поиск по пользователям и каналам на Python (поддерживает русский язык и регистр)"""
+    search_term = q.strip().lstrip('@').lstrip('#').lower()
+    if not search_term:
+        return {"results": []}
+
+    results = []
     async with aiosqlite.connect(DB_PATH) as db:
-        cur_u = await db.execute("SELECT username, display_name, avatar_url FROM users WHERE username LIKE ? OR display_name LIKE ? LIMIT 10", (query, query))
-        users = [{"type": "user", "key": r[0], "tag": f"@{r[0]}", "name": r[1], "avatar": r[2], "is_dev": is_dev(r[0])} for r in await cur_u.fetchall()]
+        # Поиск пользователей
+        cur_u = await db.execute("SELECT username, display_name, avatar_url FROM users")
+        for r in await cur_u.fetchall():
+            uname = r[0].lower()
+            dname = r[1].lower()
+            if search_term in uname or search_term in dname:
+                results.append({
+                    "type": "user",
+                    "key": r[0],
+                    "tag": f"@{r[0]}",
+                    "name": r[1],
+                    "avatar": r[2] or "",
+                    "is_dev": is_dev(r[0])
+                })
 
-        cur_c = await db.execute("SELECT channel_tag, name, avatar_url, description FROM channels WHERE channel_tag LIKE ? OR name LIKE ? LIMIT 10", (query, query))
-        channels = [{"type": "channel", "key": f"#{r[0]}", "tag": f"#{r[0]}", "name": r[1], "avatar": r[2], "desc": r[3], "is_dev": False} for r in await cur_c.fetchall()]
+        # Поиск каналов
+        cur_c = await db.execute("SELECT channel_tag, name, avatar_url, description FROM channels")
+        for r in await cur_c.fetchall():
+            ctag = r[0].lower()
+            cname = r[1].lower()
+            cdesc = (r[3] or "").lower()
+            if search_term in ctag or search_term in cname or search_term in cdesc:
+                results.append({
+                    "type": "channel",
+                    "key": f"#{r[0]}",
+                    "tag": f"#{r[0]}",
+                    "name": r[1],
+                    "avatar": r[2] or "",
+                    "desc": r[3] or "Канал",
+                    "is_dev": False
+                })
 
-        return {"results": users + channels}
+    return {"results": results[:20]}
 
 @app.get("/api/history")
 async def get_history(user: str, target: str):
@@ -1196,7 +1227,7 @@ HTML_TEMPLATE = """
 
     function getGradient(str) {
         let hash = 0;
-        for (let i = 0; i < str.length; i++) hash += str.charCodeAt(i);
+        for (let i = 0; i < (str || "user").length; i++) hash += str.charCodeAt(i);
         return gradients[hash % gradients.length];
     }
 
@@ -1412,15 +1443,16 @@ HTML_TEMPLATE = """
     let searchTimeout = null;
     function handleSearch(val) {
         clearTimeout(searchTimeout);
-        if (!val.trim()) {
+        const query = val.trim();
+        if (!query) {
             renderSidebar();
             return;
         }
         searchTimeout = setTimeout(async () => {
-            const res = await fetch(`/api/search?q=${encodeURIComponent(val)}`);
+            const res = await fetch(`/api/search?q=${encodeURIComponent(query)}`);
             const data = await res.json();
-            renderSearchResults(data.results);
-        }, 250);
+            renderSearchResults(data.results || []);
+        }, 150);
     }
 
     function renderSearchResults(results) {
@@ -1433,7 +1465,7 @@ HTML_TEMPLATE = """
         results.forEach(item => {
             const div = document.createElement("div");
             div.className = "chat-item";
-            const isUserDev = checkIsDev(item.key);
+            const isUserDev = item.is_dev;
             div.onclick = () => {
                 const exists = chatsList.find(c => c.key === item.key);
                 if (!exists) {
