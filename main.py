@@ -8,13 +8,13 @@ import re
 import base64
 from datetime import datetime
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
 
-app = FastAPI(title="Cipher Messenger v0.9(beta)")
+app = FastAPI(title="Cipher Messenger v0.9.1(beta)")
 
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -448,17 +448,15 @@ async def update_status(data: StatusModel):
 @app.post("/api/clear_history")
 async def clear_history(data: ChannelMemberModel):
     u_req = data.username.strip().lower()
-    target = data.channel_tag.strip() # Здесь channel_tag используется как ключ чата (цель)
+    target = data.channel_tag.strip()
     async with aiosqlite.connect(DB_PATH) as db:
         if target.startswith("#"):
-            # Канал/группа: очистить сообщения может только создатель
             cur = await db.execute("SELECT creator_username FROM channels WHERE LOWER(channel_tag) = LOWER(?)", (target.lstrip("#"),))
             row = await cur.fetchone()
             if row and (row[0].lower() == u_req or is_admin(u_req)):
                 await db.execute("UPDATE messages SET is_deleted = 1 WHERE LOWER(target) = LOWER(?)", (target,))
                 await db.commit()
         else:
-            # ЛС: помечаем удаленными сообщения между этими двумя юзерами
             await db.execute("""
                 UPDATE messages SET is_deleted = 1 
                 WHERE ((LOWER(sender_username) = LOWER(?) AND LOWER(target) = LOWER(?)) 
@@ -755,7 +753,6 @@ async def get_user_chats(username: str):
             if uname not in members and creator.lower() != uname and not is_admin(uname):
                 continue
 
-            # Подсчет непрочитанных сообщений
             cur_unread = await db.execute(
                 "SELECT COUNT(*) FROM messages WHERE LOWER(target) = LOWER(?) AND is_read = 0 AND LOWER(sender_username) != LOWER(?) AND is_deleted = 0",
                 (tag_key, uname)
@@ -815,7 +812,6 @@ async def get_user_chats(username: str):
             last_seen = u_data[4] or ""
             adm = bool(u_data[5]) or is_admin(real_uname)
             
-            # Непрочитанные от конкретного юзера
             cur_unread = await db.execute(
                 "SELECT COUNT(*) FROM messages WHERE LOWER(sender_username) = LOWER(?) AND LOWER(target) = LOWER(?) AND is_read = 0 AND is_deleted = 0",
                 (p, uname)
@@ -1041,7 +1037,7 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Cipher Messenger v0.9(beta)</title>
+    <title>Cipher Messenger v0.9.1(beta)</title>
     <style>
         :root[data-theme="dark"] {
             --bg-main: #0b0d13;
@@ -1124,7 +1120,6 @@ HTML_TEMPLATE = """
         }
         a.mention:hover { text-decoration: underline; }
 
-        /* Анимация появления сообщений (Fade-in) */
         @keyframes fadeInMsg {
             from { opacity: 0; transform: translateY(6px); }
             to { opacity: 1; transform: translateY(0); }
@@ -1133,7 +1128,6 @@ HTML_TEMPLATE = """
             animation: fadeInMsg 0.25s ease-out forwards;
         }
 
-        /* Плашка качества соединения */
         .network-banner {
             position: fixed;
             top: 0;
@@ -1405,8 +1399,9 @@ HTML_TEMPLATE = """
             display: flex;
             flex-direction: column;
             background: var(--bg-chat);
-            height: 100%;
+            height: 100vh;
             position: relative;
+            overflow: hidden;
         }
 
         .empty-placeholder {
@@ -1430,6 +1425,7 @@ HTML_TEMPLATE = """
             padding: 0 20px;
             border-bottom: 1px solid var(--border-color);
             flex-shrink: 0;
+            z-index: 10;
         }
         .back-btn {
             display: none;
@@ -1450,6 +1446,7 @@ HTML_TEMPLATE = """
             border-bottom: 1px solid var(--border-color);
             font-size: 0.82rem;
             cursor: pointer;
+            flex-shrink: 0;
         }
         .pinned-banner span.label { color: var(--badge-blue); font-weight: 600; margin-right: 8px; }
 
@@ -1460,6 +1457,7 @@ HTML_TEMPLATE = """
             display: flex;
             flex-direction: column;
             gap: 8px;
+            width: 100%;
         }
         .msg-row {
             display: flex;
@@ -1601,18 +1599,21 @@ HTML_TEMPLATE = """
             justify-content: space-between;
             border-top: 1px solid var(--border-color);
             font-size: 0.84rem;
+            flex-shrink: 0;
         }
         .action-banner span.title { color: var(--badge-blue); font-weight: 600; }
         .action-close { cursor: pointer; color: var(--text-sub); font-size: 1.1rem; }
 
         .input-bar {
-            padding: 10px 18px;
+            padding: 12px 18px;
             background: var(--bg-header);
             border-top: 1px solid var(--border-color);
             display: flex;
             align-items: center;
             gap: 10px;
             position: relative;
+            flex-shrink: 0;
+            z-index: 10;
         }
         .input-wrapper {
             flex: 1;
@@ -1642,6 +1643,7 @@ HTML_TEMPLATE = """
             color: var(--text-sub);
             font-size: 0.9rem;
             display: none;
+            flex-shrink: 0;
         }
 
         .bar-btn {
@@ -1670,6 +1672,7 @@ HTML_TEMPLATE = """
             display: flex;
             align-items: center;
             justify-content: center;
+            flex-shrink: 0;
         }
 
         .emoji-picker {
@@ -1807,7 +1810,6 @@ HTML_TEMPLATE = """
         <input type="text" id="auth-username" placeholder="Уникальный @юзернейм" style="display:none;">
         <input type="password" id="auth-pwd" placeholder="Пароль">
 
-        <!-- Выбор дефолтных аватарок при регистрации -->
         <div id="default-avatars-box" style="display:none; margin-bottom: 12px;">
             <label style="font-size: 0.8rem; color: var(--text-sub); display: block; margin-bottom: 6px;">Выберите аватарку:</label>
             <div style="display: flex; gap: 8px; justify-content: center;">
@@ -1899,7 +1901,7 @@ HTML_TEMPLATE = """
 
             <button class="btn-primary" style="background:#ef4444; font-size:0.85rem; padding:8px; width:100%;" onclick="clearHistoryChat()">🧹 Очистить мою историю</button>
 
-            <p id="version-text" style="font-size: 0.78rem; color: var(--text-sub); text-align: center; margin-top: 10px;">Cipher 0.9(beta)</p>
+            <p id="version-text" style="font-size: 0.78rem; color: var(--text-sub); text-align: center; margin-top: 10px;">Cipher 0.9.1(beta)</p>
         </div>
         
         <label style="font-size: 0.8rem; color: var(--text-sub); display: block; text-align:left; margin-bottom:4px;">Личный статус:</label>
@@ -2776,7 +2778,7 @@ HTML_TEMPLATE = """
         const res = await fetch("/api/clear_history", {
             method: "POST",
             headers: {"Content-Type": "application/json"},
-            body: JSON.stringify({ channel_tag: currentTarget, username: user.username })
+            body: JSON.stringify({ channel_tag: currentTarget || user.username, username: user.username })
         });
         const data = await res.json();
         if (data.status === "ok") {
