@@ -14,7 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
 
-app = FastAPI(title="Cipher Messenger v0.9.1(beta)")
+app = FastAPI(title="Cipher Messenger v1.0")
 
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -94,6 +94,10 @@ async def init_db():
                 last_seen TEXT DEFAULT '',
                 is_admin INTEGER DEFAULT 0,
                 is_banned INTEGER DEFAULT 0,
+                stars INTEGER DEFAULT 0,
+                is_pro INTEGER DEFAULT 0,
+                referral_code TEXT UNIQUE,
+                referred_by TEXT DEFAULT '',
                 created_at TEXT NOT NULL
             )
         """)
@@ -151,13 +155,13 @@ async def init_db():
             )
         """)
         await db.execute("""
-            CREATE TABLE IF NOT EXISTS bots (
+            CREATE TABLE IF NOT EXISTS gifts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                bot_username TEXT UNIQUE NOT NULL COLLATE NOCASE,
-                bot_name TEXT NOT NULL,
-                token TEXT UNIQUE NOT NULL,
-                owner_username TEXT NOT NULL COLLATE NOCASE,
-                created_at TEXT NOT NULL
+                sender TEXT NOT NULL,
+                recipient TEXT NOT NULL,
+                gift_name TEXT NOT NULL,
+                gift_icon TEXT NOT NULL,
+                timestamp TEXT NOT NULL
             )
         """)
 
@@ -166,6 +170,10 @@ async def init_db():
             ("users", "last_seen", "TEXT DEFAULT ''"),
             ("users", "is_admin", "INTEGER DEFAULT 0"),
             ("users", "is_banned", "INTEGER DEFAULT 0"),
+            ("users", "stars", "INTEGER DEFAULT 0"),
+            ("users", "is_pro", "INTEGER DEFAULT 0"),
+            ("users", "referral_code", "TEXT"),
+            ("users", "referred_by", "TEXT DEFAULT ''"),
             ("channels", "is_group", "INTEGER DEFAULT 0"),
             ("channels", "members", "TEXT DEFAULT '[]'"),
             ("messages", "forward_from", "TEXT DEFAULT ''"),
@@ -240,6 +248,7 @@ class RegisterModel(BaseModel):
     display_name: str
     password: str
     avatar_url: str = ""
+    ref_code: str = ""
 
 class LoginModel(BaseModel):
     login: str
@@ -275,6 +284,17 @@ class AdminActionModel(BaseModel):
     action: str
     report_id: int = 0
 
+class GiftModel(BaseModel):
+    sender: str
+    recipient: str
+    gift_name: str
+    gift_icon: str
+    cost: int
+
+class BuyStarsModel(BaseModel):
+    username: str
+    amount: int
+
 @app.post("/api/register")
 async def register(data: RegisterModel):
     email = data.email.strip().lower()
@@ -282,6 +302,7 @@ async def register(data: RegisterModel):
     name = data.display_name.strip() or uname
     pwd = data.password.strip()
     avatar = data.avatar_url.strip()
+    ref = data.ref_code.strip().lower()
 
     if not email or not uname or not pwd:
         return {"status": "error", "message": "Заполните все обязательные поля"}
@@ -297,19 +318,29 @@ async def register(data: RegisterModel):
     async with aiosqlite.connect(DB_PATH) as db:
         cur_u = await db.execute("SELECT id FROM users WHERE LOWER(username) = LOWER(?)", (uname,))
         if await cur_u.fetchone():
-            return {"status": "error", "message": f"Юзернейм @{uname} уже занят! Выберите другой."}
+            return {"status": "error", "message": f"Юзернейм @{uname} уже занят!"}
 
         cur_e = await db.execute("SELECT id FROM users WHERE LOWER(email) = LOWER(?)", (email,))
         if await cur_e.fetchone():
-            return {"status": "error", "message": "Пользователь с такой почтой уже существует"}
+            return {"status": "error", "message": "Почта уже зарегистрирована"}
 
         pwd_hash = hash_password(pwd)
         created_at = datetime.now().strftime("%Y-%m-%d %H:%M")
         admin_flag = 1 if is_admin(uname) else 0
+        my_ref_code = uuid.uuid4().hex[:8]
+
+        # Обработка рефералки
+        if ref:
+            cur_ref = await db.execute("SELECT username FROM users WHERE referral_code = ?", (ref,))
+            r_row = await cur_ref.fetchone()
+            if r_row and r_row[0].lower() != uname:
+                # Начисляем пригласившему бонус
+                await db.execute("UPDATE users SET stars = stars + 10 WHERE LOWER(username) = LOWER(?)", (r_row[0],))
 
         await db.execute(
-            "INSERT INTO users (email, username, display_name, password_hash, avatar_url, is_admin, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (email, uname, name, pwd_hash, avatar, admin_flag, created_at)
+            """INSERT INTO users (email, username, display_name, password_hash, avatar_url, is_admin, referral_code, referred_by, created_at) 
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (email, uname, name, pwd_hash, avatar, admin_flag, my_ref_code, ref, created_at)
         )
         await db.commit()
         return {
@@ -320,7 +351,10 @@ async def register(data: RegisterModel):
             "avatar_url": avatar,
             "custom_status": "online",
             "is_admin": admin_flag,
-            "is_dev": is_admin(uname)
+            "is_dev": is_admin(uname),
+            "stars": 0,
+            "is_pro": 0,
+            "referral_code": my_ref_code
         }
 
 @app.post("/api/login")
@@ -330,7 +364,7 @@ async def login(data: LoginModel):
 
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            """SELECT username, display_name, email, avatar_url, custom_status, is_admin, is_banned 
+            """SELECT username, display_name, email, avatar_url, custom_status, is_admin, is_banned, stars, is_pro, referral_code 
                FROM users 
                WHERE (LOWER(email) = LOWER(?) OR LOWER(username) = LOWER(?)) AND password_hash = ?""",
             (login_val, login_val, pwd_hash)
@@ -355,7 +389,10 @@ async def login(data: LoginModel):
                 "avatar_url": user[3] or "",
                 "custom_status": user[4] or "online",
                 "is_admin": user_is_admin,
-                "is_dev": is_admin(user[0])
+                "is_dev": is_admin(user[0]),
+                "stars": user[7] or 0,
+                "is_pro": user[8] or 0,
+                "referral_code": user[9] or ""
             }
         return {"status": "error", "message": "Неверный логин или пароль"}
 
@@ -393,6 +430,63 @@ async def update_profile(data: UpdateProfileModel):
         await db.commit()
 
         return {"status": "ok", "display_name": new_name, "email": new_email}
+
+@app.post("/api/buy_subscription")
+async def buy_subscription(data: StatusModel):
+    # Стоимость подписки: 100 звезд
+    uname = data.username.strip().lower()
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT stars FROM users WHERE LOWER(username) = LOWER(?)", (uname,))
+        row = await cur.fetchone()
+        if not row:
+            return {"status": "error", "message": "Пользователь не найден"}
+        stars = row[0]
+        if stars < 100:
+            return {"status": "error", "message": "Недостаточно звезд (нужно 100 ⭐️)"}
+        
+        await db.execute("UPDATE users SET stars = stars - 100, is_pro = 1 WHERE LOWER(username) = LOWER(?)", (uname,))
+        await db.commit()
+    return {"status": "ok", "message": "Подписка PRO успешно активирована!"}
+
+@app.post("/api/buy_stars")
+async def buy_stars(data: BuyStarsModel):
+    uname = data.username.strip().lower()
+    amount = data.amount
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE users SET stars = stars + ? WHERE LOWER(username) = LOWER(?)", (amount, uname))
+        await db.commit()
+    return {"status": "ok"}
+
+@app.post("/api/send_gift")
+async def send_gift(data: GiftModel):
+    sender = data.sender.strip().lower()
+    recipient = data.recipient.strip().lower()
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT stars FROM users WHERE LOWER(username) = LOWER(?)", (sender,))
+        row = await cur.fetchone()
+        if not row:
+            return {"status": "error", "message": "Отправитель не найден"}
+        if row[0] < data.cost:
+            return {"status": "error", "message": "Недостаточно звезд для покупки подарка"}
+
+        # Снимаем звезды с отправителя
+        if data.cost > 0:
+            await db.execute("UPDATE users SET stars = stars - ? WHERE LOWER(username) = LOWER(?)", (data.cost, sender))
+
+        time_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+        await db.execute(
+            "INSERT INTO gifts (sender, recipient, gift_name, gift_icon, timestamp) VALUES (?, ?, ?, ?, ?)",
+            (sender, recipient, data.gift_name, data.gift_icon, time_str)
+        )
+        await db.commit()
+    return {"status": "ok"}
+
+@app.get("/api/gifts")
+async def get_gifts(username: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT sender, gift_name, gift_icon, timestamp FROM gifts WHERE LOWER(recipient) = LOWER(?) ORDER BY id DESC", (username,))
+        gifts = [{"sender": r[0], "gift_name": r[1], "gift_icon": r[2], "timestamp": r[3]} for r in await cur.fetchall()]
+    return {"status": "ok", "gifts": gifts}
 
 @app.post("/api/upload_file")
 async def upload_file_endpoint(file: UploadFile = File(...)):
@@ -695,7 +789,7 @@ async def get_user_info(username: str, current_user: str):
     cur_uname = current_user.strip().lower()
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "SELECT username, display_name, email, avatar_url, created_at, custom_status, last_seen, is_admin FROM users WHERE LOWER(username) = LOWER(?)",
+            "SELECT username, display_name, email, avatar_url, created_at, custom_status, last_seen, is_admin, stars, is_pro FROM users WHERE LOWER(username) = LOWER(?)",
             (target_uname,)
         )
         row = await cur.fetchone()
@@ -716,6 +810,8 @@ async def get_user_info(username: str, current_user: str):
             "last_seen": row[6] or "",
             "is_admin": bool(row[7]) or is_admin(row[0]),
             "is_dev": is_admin(row[0]),
+            "stars": row[8] or 0,
+            "is_pro": row[9] or 0,
             "is_blocked": is_blocked
         }
 
@@ -1037,7 +1133,7 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Cipher Messenger v0.9.1(beta)</title>
+    <title>Cipher Messenger v1.0</title>
     <style>
         :root[data-theme="dark"] {
             --bg-main: #0b0d13;
@@ -1102,6 +1198,20 @@ HTML_TEMPLATE = """
             display: inline-flex;
             align-items: center;
             box-shadow: 0 0 10px rgba(236, 72, 153, 0.35);
+            text-transform: uppercase;
+        }
+
+        .pro-badge {
+            background: linear-gradient(135deg, #f59e0b, #ef4444);
+            color: #fff !important;
+            font-size: 0.65rem;
+            font-weight: 800;
+            padding: 2px 6px;
+            border-radius: 6px;
+            letter-spacing: 0.5px;
+            display: inline-flex;
+            align-items: center;
+            box-shadow: 0 0 10px rgba(245, 158, 11, 0.35);
             text-transform: uppercase;
         }
 
@@ -1808,6 +1918,7 @@ HTML_TEMPLATE = """
         <input type="text" id="auth-login" placeholder="Email или @юзернейм">
         <input type="text" id="auth-name" placeholder="Отображаемое имя (например, Miles)" style="display:none;">
         <input type="text" id="auth-username" placeholder="Уникальный @юзернейм" style="display:none;">
+        <input type="text" id="auth-ref" placeholder="Реферальный код (если есть)" style="display:none;">
         <input type="password" id="auth-pwd" placeholder="Пароль">
 
         <div id="default-avatars-box" style="display:none; margin-bottom: 12px;">
@@ -1876,6 +1987,18 @@ HTML_TEMPLATE = """
         <div id="profile-avatar-preview" style="width: 80px; height: 80px; border-radius: 50%; margin: 15px auto; display:flex; align-items:center; justify-content:center; font-size:2rem; font-weight:bold; color:#fff; overflow:hidden;"></div>
         
         <div style="text-align: left; margin-bottom: 12px;">
+            <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:8px;">
+                <div>
+                    <span id="profile-stars-count" style="font-weight:bold; color:#f59e0b;">⭐ 0 звезд</span>
+                </div>
+                <button class="btn-primary" style="width:auto; padding:6px 12px; margin-top:0; background:#f59e0b; color:#000; font-size:0.8rem;" onclick="openStarsModal()">Купить звезды ⭐️</button>
+            </div>
+
+            <div id="pro-status-box" style="background: rgba(245, 158, 11, 0.1); border: 1px solid #f59e0b; padding: 10px; border-radius: 10px; margin-bottom: 10px; text-align: center; display: none;">
+                <span style="font-weight: bold; color: #f59e0b;">👑 Подписка PRO активна</span>
+            </div>
+            <button id="buy-pro-btn" class="btn-primary" style="background: linear-gradient(135deg, #f59e0b, #ef4444); margin-bottom: 12px; display: none;" onclick="buyProSubscription()">Купить PRO (100 ⭐️) + 50 ⭐️ в подарок</button>
+
             <label style="font-size: 0.8rem; color: var(--text-sub); display: block; margin-bottom:4px;">Отображаемое имя (Ник):</label>
             <input type="text" id="profile-name-input" placeholder="Ваш ник">
 
@@ -1891,17 +2014,38 @@ HTML_TEMPLATE = """
             <div style="display:flex; align-items:center; gap:8px; margin-bottom: 12px;">
                 <p id="profile-tag" style="color: var(--badge-blue); font-size: 0.95rem; font-weight: bold;"></p>
                 <span id="profile-dev-badge" class="dev-badge" style="display:none;">🛠️ DEV</span>
+                <span id="profile-pro-badge" class="pro-badge" style="display:none;">👑 PRO</span>
+            </div>
+
+            <!-- Реферальная ссылка -->
+            <div style="background:var(--bg-input); padding:10px; border-radius:10px; margin-bottom:12px;">
+                <label style="font-size: 0.75rem; color: var(--text-sub); display: block; margin-bottom:2px;">🎁 Реферальная ссылка:</label>
+                <div style="display:flex; gap:6px;">
+                    <input type="text" id="ref-link-input" readonly style="margin-bottom:0; font-size:0.85rem;" />
+                    <button class="btn-primary" style="width:auto; margin-top:0; padding:0 12px;" onclick="copyRefLink()">Копировать</button>
+                </div>
             </div>
             
             <div style="display:flex; gap:8px; margin-bottom: 12px;">
-                <button class="btn-primary" style="background:#10b981; font-size:0.85rem; padding:8px;" onclick="exportChatsJSON()">📥 Экспорт чатов (JSON)</button>
+                <button class="btn-primary" style="background:#10b981; font-size:0.85rem; padding:8px;" onclick="exportChatsJSON()">📥 Экспорт</button>
                 <button class="btn-primary" style="background:#6366f1; font-size:0.85rem; padding:8px;" onclick="document.getElementById('import-file-input').click()">📤 Импорт</button>
                 <input type="file" id="import-file-input" style="display:none;" accept=".json" onchange="importChatsJSON(this.files[0])">
             </div>
 
             <button class="btn-primary" style="background:#ef4444; font-size:0.85rem; padding:8px; width:100%;" onclick="clearHistoryChat()">🧹 Очистить мою историю</button>
 
-            <p id="version-text" style="font-size: 0.78rem; color: var(--text-sub); text-align: center; margin-top: 10px;">Cipher 0.9.1(beta)</p>
+            <!-- Кнопки релиза v1.0 -->
+            <div style="display:flex; gap:6px; margin-top: 12px;">
+                <button class="btn-primary" style="background:#334155; font-size:0.8rem; padding:8px;" onclick="openAboutModal()">ℹ️ О проекте</button>
+                <button class="btn-primary" style="background:#334155; font-size:0.8rem; padding:8px;" onclick="openManifestModal()">📜 Манифест</button>
+                <button class="btn-primary" style="background:#334155; font-size:0.8rem; padding:8px;" onclick="openRoadmapModal()">🗺️ Roadmap</button>
+            </div>
+            <div style="display:flex; gap:6px; margin-top: 6px;">
+                <button class="btn-primary" style="background:#334155; font-size:0.8rem; padding:8px;" onclick="openBugModal()">🐛 Сообщить об ошибке</button>
+                <a href="https://t.me/" target="_blank" class="btn-primary" style="background:#229ED9; font-size:0.8rem; padding:8px; text-align:center; text-decoration:none; display:block; margin-top:6px;">📢 Telegram Канал</a>
+            </div>
+
+            <p id="version-text" style="font-size: 0.78rem; color: var(--text-sub); text-align: center; margin-top: 10px;">Cipher v1.0</p>
         </div>
         
         <label style="font-size: 0.8rem; color: var(--text-sub); display: block; text-align:left; margin-bottom:4px;">Личный статус:</label>
@@ -1920,6 +2064,117 @@ HTML_TEMPLATE = """
     </div>
 </div>
 
+<!-- Модалка «О проекте» -->
+<div id="about-modal" class="modal-overlay" style="display: none;">
+    <div class="card-modal">
+        <h2>ℹ️ О проекте Cipher</h2>
+        <p class="subtitle">Независимый безопасный мессенджер</p>
+        <div style="font-size: 0.9rem; line-height: 1.6; color: var(--text-main); margin-bottom: 20px;">
+            <p><b>Cipher</b> — это независимый защищенный мессенджер, созданный разработчиком с нуля. Наш проект задуман как свободная платформа для коммуникации, где во главу угла поставлены приватность, скорость и отсутствие слежки со стороны корпораций.</p>
+        </div>
+        <button class="btn-primary" onclick="document.getElementById('about-modal').style.display='none'">Закрыть</button>
+    </div>
+</div>
+
+<!-- Модалка «Манифест» -->
+<div id="manifest-modal" class="modal-overlay" style="display: none;">
+    <div class="card-modal">
+        <h2>📜 Манифест Cipher</h2>
+        <p class="subtitle">Наша философия и принципы</p>
+        <div style="font-size: 0.9rem; line-height: 1.6; color: var(--text-main); margin-bottom: 20px;">
+            <p>🕊️ <b>Свобода слова.</b> Каждое мнение имеет право быть услышанным.</p><br>
+            <p>🛡️ <b>Без слежки.</b> Никаких скрытых трекеров, аналитики и сбора личных данных.</p><br>
+            <p>🚫 <b>Без рекламы.</b> Никаких баннеров, навязанных товаров и алгоритмических лент.</p><br>
+            <p>🔓 <b>Без цензуры.</b> Платформа принадлежит её пользователям.</p>
+        </div>
+        <button class="btn-primary" onclick="document.getElementById('manifest-modal').style.display='none'">Закрыть</button>
+    </div>
+</div>
+
+<!-- Модалка «Roadmap» -->
+<div id="roadmap-modal" class="modal-overlay" style="display: none;">
+    <div class="card-modal">
+        <h2>🗺️ Roadmap развития</h2>
+        <p class="subtitle">План покорения цифрового мира</p>
+        <div style="font-size: 0.9rem; line-height: 1.6; color: var(--text-main); margin-bottom: 20px;">
+            <p>✅ <b>v1.0 (Релиз):</b> Базовый мессенджер, шифрование, каналы, группы, подарки, боты.</p><br>
+            <p>🚀 <b>v1.1:</b> Сквозное шифрование (E2E) с публичными ключами на клиенте.</p><br>
+            <p>🚀 <b>v1.2:</b> Интеграция мини-приложений (Mini Apps) и расширенная кастомизация.</p><br>
+            <p>📱 <b>Мобильное приложение:</b> Нативные приложения для iOS и Android.</p><br>
+            <p>📞 <b>Звонки:</b> Аудио и видеозвонки высокой четкости (WebRTC Mesh/SFU).</p><br>
+            <p>📢 <b>Каналы:</b> Продвинутая аналитика и монетизация для авторов каналов.</p>
+        </div>
+        <button class="btn-primary" onclick="document.getElementById('roadmap-modal').style.display='none'">Закрыть</button>
+    </div>
+</div>
+
+<!-- Модалка «Сообщить об ошибке» -->
+<div id="bug-modal" class="modal-overlay" style="display: none;">
+    <div class="card-modal">
+        <h2>🐛 Сообщить об ошибке</h2>
+        <p class="subtitle">Помогите нам сделать Cipher лучше</p>
+        <textarea id="bug-text-input" rows="4" placeholder="Опишите баг или проблему..." style="width:100%; margin-bottom:12px; background:var(--bg-input); border:1px solid var(--card-border); color:var(--text-main); border-radius:12px; padding:12px; outline:none;"></textarea>
+        <button class="btn-primary" onclick="submitBugReport()">Отправить разработчику</button>
+        <button class="btn-cancel" onclick="document.getElementById('bug-modal').style.display='none'">Отмена</button>
+    </div>
+</div>
+
+<!-- Модалка Покупки Звезд -->
+<div id="stars-modal" class="modal-overlay" style="display: none;">
+    <div class="card-modal" style="text-align:center;">
+        <h2>⭐ Покупка Telegram Stars</h2>
+        <p class="subtitle">Пополните баланс звезд для покупки подарков и PRO</p>
+        <div style="display:grid; grid-template-columns: 1fr 1fr; gap:10px; margin-bottom:16px;">
+            <button class="btn-primary" style="background:#1e2332;" onclick="buyStarsPack(50)">50 звезд ⭐️<br><span style="font-size:0.75rem; color:var(--text-sub);">$0.99</span></button>
+            <button class="btn-primary" style="background:#1e2332;" onclick="buyStarsPack(100)">100 звезд ⭐️<br><span style="font-size:0.75rem; color:var(--text-sub);">$1.99</span></button>
+            <button class="btn-primary" style="background:#1e2332;" onclick="buyStarsPack(250)">250 звезд ⭐️<br><span style="font-size:0.75rem; color:var(--text-sub);">$4.99</span></button>
+            <button class="btn-primary" style="background:#1e2332;" onclick="buyStarsPack(500)">500 звезд ⭐️<br><span style="font-size:0.75rem; color:var(--text-sub);">$9.99</span></button>
+        </div>
+        <button class="btn-cancel" onclick="document.getElementById('stars-modal').style.display='none'">Закрыть</button>
+    </div>
+</div>
+
+<!-- Модалка Отправки Подарка -->
+<div id="gift-modal" class="modal-overlay" style="display: none;">
+    <div class="card-modal" style="text-align:center;">
+        <h2>🎁 Подарок пользователю</h2>
+        <p class="subtitle" id="gift-recipient-title">Выберите подарок</p>
+        <div style="display:grid; grid-template-columns: 1fr 1fr; gap:10px; margin-bottom:16px;">
+            <div style="background:var(--bg-input); padding:14px; border-radius:12px; cursor:pointer;" onclick="sendGiftItem('Спасибо', '💖', 0)">
+                <div style="font-size:2rem;">💖</div>
+                <div style="font-weight:bold; margin-top:4px;">Спасибо</div>
+                <div style="font-size:0.75rem; color:var(--online-green);">Бесплатно</div>
+            </div>
+            <div style="background:var(--bg-input); padding:14px; border-radius:12px; cursor:pointer;" onclick="sendGiftItem('Лайк', '👍', 0)">
+                <div style="font-size:2rem;">👍</div>
+                <div style="font-weight:bold; margin-top:4px;">Лайк</div>
+                <div style="font-size:0.75rem; color:var(--online-green);">Бесплатно</div>
+            </div>
+            <div style="background:var(--bg-input); padding:14px; border-radius:12px; cursor:pointer;" onclick="sendGiftItem('Ракета', '🚀', 50)">
+                <div style="font-size:2rem;">🚀</div>
+                <div style="font-weight:bold; margin-top:4px;">Ракета</div>
+                <div style="font-size:0.75rem; color:#f59e0b;">50 ⭐️</div>
+            </div>
+            <div style="background:var(--bg-input); padding:14px; border-radius:12px; cursor:pointer;" onclick="sendGiftItem('Колечко', '💍', 100)">
+                <div style="font-size:2rem;">💍</div>
+                <div style="font-weight:bold; margin-top:4px;">Колечко</div>
+                <div style="font-size:0.75rem; color:#f59e0b;">100 ⭐️</div>
+            </div>
+            <div style="background:var(--bg-input); padding:14px; border-radius:12px; cursor:pointer;" onclick="sendGiftItem('Корона', '👑', 250)">
+                <div style="font-size:2rem;">👑</div>
+                <div style="font-weight:bold; margin-top:4px;">Корона</div>
+                <div style="font-size:0.75rem; color:#f59e0b;">250 ⭐️</div>
+            </div>
+            <div style="background:var(--bg-input); padding:14px; border-radius:12px; cursor:pointer;" onclick="sendGiftItem('Алмаз', '💎', 500)">
+                <div style="font-size:2rem;">💎</div>
+                <div style="font-weight:bold; margin-top:4px;">Алмаз</div>
+                <div style="font-size:0.75rem; color:#f59e0b;">500 ⭐️</div>
+            </div>
+        </div>
+        <button class="btn-cancel" onclick="document.getElementById('gift-modal').style.display='none'">Отмена</button>
+    </div>
+</div>
+
 <div id="user-info-modal" class="modal-overlay" style="display: none;">
     <div class="card-modal" style="text-align: center;">
         <h2>Профиль пользователя</h2>
@@ -1928,17 +2183,21 @@ HTML_TEMPLATE = """
             <h3 id="info-name" style="color:var(--text-main);"></h3>
             <span id="info-dev-badge" class="dev-badge" style="display:none;">🛠️ DEV</span>
             <span id="info-admin-badge" class="dev-badge" style="display:none; background:linear-gradient(135deg, #2563eb, #38bdf8);">🛡️ АДМИН</span>
+            <span id="info-pro-badge" class="pro-badge" style="display:none;">👑 PRO</span>
         </div>
         <p id="info-tag" style="color: var(--badge-blue); font-size: 0.9rem; margin-bottom: 6px;"></p>
         <p id="info-status-text" style="font-size: 0.85rem; color: var(--online-green); margin-bottom: 4px;">🟢 В сети</p>
-        <p id="info-date" style="color: var(--text-sub); font-size: 0.8rem; margin-bottom: 16px;">Регистрация: ...</p>
+        <p id="info-date" style="color: var(--text-sub); font-size: 0.8rem; margin-bottom: 12px;">Регистрация: ...</p>
         
-        <div id="report-box" style="margin-bottom: 12px; text-align: left;">
-            <input type="text" id="report-reason-input" placeholder="Причина жалобы (например, спам, оскорбления)" style="margin-bottom: 6px;">
-            <button class="btn-primary" style="background: #eab308; color: #000;" onclick="submitReport()">⚠️ Пожаловаться</button>
-        </div>
+        <!-- Полученные подарки -->
+        <div id="user-gifts-container" style="display:flex; gap:6px; justify-content:center; margin-bottom: 14px; flex-wrap:wrap;"></div>
 
-        <button class="btn-primary" id="info-block-btn" style="background:#ef4444;" onclick="toggleBlockContact()">🚫 Заблокировать</button>
+        <button class="btn-primary" style="background:#f59e0b; color:#000; margin-bottom:6px;" onclick="openGiftModal()">🎁 Отправить подарок</button>
+        <button class="btn-primary" id="info-block-btn" style="background:#ef4444; margin-bottom:6px;" onclick="toggleBlockContact()">🚫 Заблокировать</button>
+        <div id="report-box" style="margin-bottom: 6px; text-align: left;">
+            <input type="text" id="report-reason-input" placeholder="Причина жалобы..." style="margin-bottom: 4px;">
+            <button class="btn-primary" style="background: #eab308; color: #000; margin-top:0;" onclick="submitReport()">⚠️ Пожаловаться</button>
+        </div>
         <button class="btn-cancel" onclick="document.getElementById('user-info-modal').style.display='none'">Закрыть</button>
     </div>
 </div>
@@ -1986,6 +2245,7 @@ HTML_TEMPLATE = """
                         <span id="my-display-name" style="font-weight:600; font-size:0.92rem; color:var(--text-main);">Загрузка...</span>
                         <span id="my-dev-badge" class="dev-badge" style="display:none;">DEV</span>
                         <span id="my-admin-badge" class="dev-badge" style="display:none; background:linear-gradient(135deg, #2563eb, #38bdf8);">АДМИН</span>
+                        <span id="my-pro-badge" class="pro-badge" style="display:none;">PRO</span>
                     </div>
                     <div id="my-tag" style="font-size:0.75rem; color:var(--text-sub);">@...</div>
                 </div>
@@ -2217,6 +2477,20 @@ HTML_TEMPLATE = """
 
     window.onload = () => {
         requestPermissionsOnStart();
+        // Автозаполнение рефералки из ссылки
+        const urlParams = new URLSearchParams(window.location.search);
+        const refParam = urlParams.get("ref");
+        if (refParam) {
+            isRegister = true;
+            document.getElementById("auth-name").style.display = "block";
+            document.getElementById("auth-username").style.display = "block";
+            document.getElementById("auth-ref").style.display = "block";
+            document.getElementById("default-avatars-box").style.display = "block";
+            document.getElementById("auth-btn").innerText = "Зарегистрироваться в Cipher";
+            document.getElementById("auth-toggle").innerText = "Уже есть аккаунт? Войти";
+            document.getElementById("auth-ref").value = refParam;
+        }
+
         if (user && user.username) {
             document.getElementById("auth-modal").style.display = "none";
             startApp();
@@ -2320,6 +2594,7 @@ HTML_TEMPLATE = """
         isRegister = !isRegister;
         document.getElementById("auth-name").style.display = isRegister ? "block" : "none";
         document.getElementById("auth-username").style.display = isRegister ? "block" : "none";
+        document.getElementById("auth-ref").style.display = isRegister ? "block" : "none";
         document.getElementById("default-avatars-box").style.display = isRegister ? "block" : "none";
         document.getElementById("auth-btn").innerText = isRegister ? "Зарегистрироваться в Cipher" : "Войти в Cipher";
         document.getElementById("auth-toggle").innerText = isRegister ? "Уже есть аккаунт? Войти" : "Нет аккаунта? Создать аккаунт";
@@ -2339,11 +2614,12 @@ HTML_TEMPLATE = """
             const display_name = document.getElementById("auth-name").value;
             const username = document.getElementById("auth-username").value;
             const password = document.getElementById("auth-pwd").value;
+            const refCode = document.getElementById("auth-ref").value;
 
             const res = await fetch("/api/register", {
                 method: "POST",
                 headers: {"Content-Type": "application/json"},
-                body: JSON.stringify({ email, display_name, username, password, avatar_url: selectedRegAvatarUrl })
+                body: JSON.stringify({ email, display_name, username, password, avatar_url: selectedRegAvatarUrl, ref_code: refCode })
             });
             const data = await res.json();
             if (data.status === "ok") {
@@ -2405,6 +2681,10 @@ HTML_TEMPLATE = """
         if (checkIsDev(user.username)) {
             const myDevBadge = document.getElementById("my-dev-badge");
             if (myDevBadge) myDevBadge.style.display = "inline-flex";
+        }
+        if (user.is_pro) {
+            const myProBadge = document.getElementById("my-pro-badge");
+            if (myProBadge) myProBadge.style.display = "inline-flex";
         }
 
         connectWebSocket();
@@ -2502,11 +2782,98 @@ HTML_TEMPLATE = """
         if (devBadge) {
             devBadge.style.display = checkIsDev(user.username) ? "inline-flex" : "none";
         }
+        const proBadge = document.getElementById("profile-pro-badge");
+        if (proBadge) {
+            proBadge.style.display = user.is_pro ? "inline-flex" : "none";
+        }
+
+        document.getElementById("profile-stars-count").innerText = `⭐ ${user.stars || 0} звезд`;
+        document.getElementById("ref-link-input").value = `${window.location.origin}/?ref=${user.referral_code}`;
+
+        const proBox = document.getElementById("pro-status-box");
+        const buyProBtn = document.getElementById("buy-pro-btn");
+        if (user.is_pro) {
+            proBox.style.display = "block";
+            buyProBtn.style.display = "none";
+        } else {
+            proBox.style.display = "none";
+            buyProBtn.style.display = "block";
+        }
+
         if (statusSelect) {
             statusSelect.value = user.custom_status || "online";
         }
 
         document.getElementById("profile-modal").style.display = "flex";
+    }
+
+    function copyRefLink() {
+        const input = document.getElementById("ref-link-input");
+        navigator.clipboard.writeText(input.value);
+        alert("Реферальная ссылка скопирована в буфер обмена!");
+    }
+
+    async function buyProSubscription() {
+        const res = await fetch("/api/buy_subscription", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({ username: user.username, status: "online" })
+        });
+        const data = await res.json();
+        if (data.status === "ok") {
+            alert(data.message);
+            user.is_pro = 1;
+            user.stars = (user.stars || 0) - 50; // с учетом бонуса или списания
+            localStorage.setItem("messenger_user", JSON.stringify(user));
+            location.reload();
+        } else {
+            alert(data.message);
+        }
+    }
+
+    function openStarsModal() {
+        document.getElementById("stars-modal").style.display = "flex";
+    }
+
+    async function buyStarsPack(amount) {
+        const res = await fetch("/api/buy_stars", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({ username: user.username, amount: amount })
+        });
+        const data = await res.json();
+        if (data.status === "ok") {
+            user.stars = (user.stars || 0) + amount;
+            localStorage.setItem("messenger_user", JSON.stringify(user));
+            document.getElementById("profile-stars-count").innerText = `⭐ ${user.stars} звезд`;
+            document.getElementById("stars-modal").style.display = "none";
+            alert(`Успешно куплено ${amount} звезд! ⭐️`);
+        }
+    }
+
+    function openGiftModal() {
+        if (!viewingPeerInfo) return;
+        document.getElementById("gift-recipient-title").innerText = `Подарок для @${viewingPeerInfo.username}`;
+        document.getElementById("gift-modal").style.display = "flex";
+    }
+
+    async function sendGiftItem(name, icon, cost) {
+        if (!viewingPeerInfo) return;
+        const res = await fetch("/api/send_gift", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({ sender: user.username, recipient: viewingPeerInfo.username, gift_name: name, gift_icon: icon, cost: cost })
+        });
+        const data = await res.json();
+        if (data.status === "ok") {
+            alert(`Подарок "${name}" успешно отправлен! 🎁`);
+            user.stars = Math.max(0, (user.stars || 0) - cost);
+            localStorage.setItem("messenger_user", JSON.stringify(user));
+            document.getElementById("gift-modal").style.display = "none";
+            document.getElementById("user-info-modal").style.display = "none";
+        } else {
+            alert(data.message);
+        }
     }
 
     async function saveProfileChanges() {
@@ -2591,6 +2958,26 @@ HTML_TEMPLATE = """
             document.getElementById("info-dev-badge").style.display = data.is_dev ? "inline-flex" : "none";
             document.getElementById("info-admin-badge").style.display = (data.is_admin && !data.is_dev) ? "inline-flex" : "none";
             
+            const proBadge = document.getElementById("info-pro-badge");
+            if (proBadge) {
+                proBadge.style.display = data.is_pro ? "inline-flex" : "none";
+            }
+
+            // Подгружаем подарки пользователя
+            const giftsContainer = document.getElementById("user-gifts-container");
+            giftsContainer.innerHTML = "Загрузка подарков...";
+            try {
+                const gRes = await fetch(`/api/gifts?username=${encodeURIComponent(data.username)}`);
+                const gData = await gRes.json();
+                if (gData.gifts && gData.gifts.length > 0) {
+                    giftsContainer.innerHTML = gData.gifts.map(g => `<span title="От: @${g.sender}" style="font-size:1.4rem; background:var(--bg-input); padding:4px 8px; border-radius:8px;">${g.gift_icon}</span>`).join("");
+                } else {
+                    giftsContainer.innerHTML = "<span style='font-size:0.75rem; color:var(--text-sub);'>Подарков пока нет</span>";
+                }
+            } catch(e) {
+                giftsContainer.innerHTML = "";
+            }
+
             const reportBox = document.getElementById("report-box");
             if (data.username.toLowerCase() === user.username.toLowerCase()) {
                 reportBox.style.display = "none";
@@ -2604,6 +2991,24 @@ HTML_TEMPLATE = """
 
             document.getElementById("user-info-modal").style.display = "flex";
         }
+    }
+
+    function openAboutModal() { document.getElementById("about-modal").style.display = "flex"; }
+    function openManifestModal() { document.getElementById("manifest-modal").style.display = "flex"; }
+    function openRoadmapModal() { document.getElementById("roadmap-modal").style.display = "flex"; }
+    function openBugModal() { document.getElementById("bug-modal").style.display = "flex"; }
+
+    async function submitBugReport() {
+        const txt = document.getElementById("bug-text-input").value.trim();
+        if (!txt) return;
+        await fetch("/api/report", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({ reporter: user.username, reported_user: "SYSTEM_BUG", reason: txt })
+        });
+        alert("Спасибо! Ошибка отправлена разработчику.");
+        document.getElementById("bug-text-input").value = "";
+        document.getElementById("bug-modal").style.display = "none";
     }
 
     async function submitReport() {
