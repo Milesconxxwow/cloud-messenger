@@ -14,7 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
 
-app = FastAPI(title="Cipher Messenger v1.0.2")
+app = FastAPI(title="Cipher Messenger v1.0.3")
 
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -1128,8 +1128,8 @@ HTML_TEMPLATE = """
 <html lang="ru" data-theme="dark">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Cipher Messenger v1.0.2</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, interactive-widget=resizes-content">
+    <title>Cipher Messenger v1.0.3</title>
     <style>
         :root[data-theme="dark"] {
             --bg-main: #0b0d13;
@@ -1177,10 +1177,11 @@ HTML_TEMPLATE = """
 
         body, html {
             height: 100%;
+            width: 100%;
             background-color: var(--bg-main);
             color: var(--text-main);
             overflow: hidden;
-            transition: background-color 0.2s, color 0.2s;
+            position: fixed;
         }
 
         .dev-badge {
@@ -1336,9 +1337,8 @@ HTML_TEMPLATE = """
 
         #app-container {
             display: flex;
-            height: 100vh;
-            width: 100vw;
-            overflow: hidden;
+            height: 100%;
+            width: 100%;
             position: relative;
         }
 
@@ -1525,9 +1525,8 @@ HTML_TEMPLATE = """
             padding: 20px;
         }
 
-        /* ИСПРАВЛЕННАЯ АДАПТИВНАЯ ШАПКА ЧАТА */
         .chat-header {
-            height: 68px;
+            height: 60px;
             background: var(--bg-header);
             display: flex;
             align-items: center;
@@ -1579,12 +1578,13 @@ HTML_TEMPLATE = """
 
         .messages-container {
             flex: 1;
-            padding: 20px;
+            padding: 15px;
             overflow-y: auto;
             display: flex;
             flex-direction: column;
             gap: 8px;
             width: 100%;
+            -webkit-overflow-scrolling: touch;
         }
         .msg-row {
             display: flex;
@@ -1605,7 +1605,7 @@ HTML_TEMPLATE = """
         }
 
         .bubble {
-            max-width: 65%;
+            max-width: 70%;
             padding: 9px 13px;
             border-radius: 14px;
             font-size: 0.92rem;
@@ -1652,7 +1652,7 @@ HTML_TEMPLATE = """
         
         .bubble-img {
             max-width: 100%;
-            max-height: 320px;
+            max-height: 280px;
             border-radius: 10px;
             margin-top: 4px;
             display: block;
@@ -1661,7 +1661,7 @@ HTML_TEMPLATE = """
 
         .bubble-video {
             max-width: 100%;
-            max-height: 320px;
+            max-height: 280px;
             border-radius: 10px;
             margin-top: 4px;
             display: block;
@@ -1675,7 +1675,7 @@ HTML_TEMPLATE = """
             gap: 8px;
             margin-top: 4px;
         }
-        .audio-player audio { height: 32px; width: 220px; outline: none; }
+        .audio-player audio { height: 32px; width: 180px; outline: none; }
 
         .file-attachment {
             display: flex;
@@ -1720,7 +1720,7 @@ HTML_TEMPLATE = """
 
         .action-banner {
             background: var(--bg-sidebar-hover);
-            padding: 8px 18px;
+            padding: 8px 15px;
             display: none;
             align-items: center;
             justify-content: space-between;
@@ -1731,16 +1731,20 @@ HTML_TEMPLATE = """
         .action-banner span.title { color: var(--badge-blue); font-weight: 600; }
         .action-close { cursor: pointer; color: var(--text-sub); font-size: 1.1rem; }
 
+        /* ИСПРАВЛЕННАЯ ПАНЕЛЬ ВВОДА ДЛЯ ТЕЛЕФОНОВ */
         .input-bar {
-            padding: 10px 14px;
+            padding: 10px 15px;
             background: var(--bg-header);
             border-top: 1px solid var(--border-color);
             display: flex;
             align-items: center;
             gap: 8px;
-            position: relative;
+            position: sticky;
+            bottom: 0;
+            left: 0;
+            right: 0;
             flex-shrink: 0;
-            z-index: 10;
+            z-index: 20;
         }
         .input-wrapper {
             flex: 1;
@@ -1783,6 +1787,7 @@ HTML_TEMPLATE = """
             align-items: center;
             justify-content: center;
             transition: color 0.2s;
+            padding: 4px;
         }
         .bar-btn:hover { color: var(--text-main); }
         .bar-btn.recording { color: #ef4444; animation: pulse 1s infinite; }
@@ -1827,7 +1832,7 @@ HTML_TEMPLATE = """
 
         .scroll-down-btn {
             position: absolute;
-            bottom: 80px;
+            bottom: 75px;
             right: 20px;
             background: var(--badge-blue);
             color: white;
@@ -1893,11 +1898,31 @@ HTML_TEMPLATE = """
         @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.4; } 100% { opacity: 1; } }
 
         @media (max-width: 768px) {
-            #sidebar { width: 100%; }
-            #chat-area { display: none; }
+            body, html {
+                position: fixed;
+                inset: 0;
+            }
+            #app-container {
+                position: absolute;
+                inset: 0;
+            }
+            #sidebar {
+                position: absolute;
+                inset: 0;
+                width: 100% !important;
+                z-index: 5;
+            }
+            #chat-area {
+                position: absolute;
+                inset: 0;
+                width: 100% !important;
+                height: 100% !important;
+                display: none;
+                z-index: 10;
+            }
             body.in-chat #sidebar { display: none; }
             body.in-chat #chat-area { display: flex; }
-            .back-btn { display: block; }
+            .back-btn { display: block !important; }
             .bubble { max-width: 82%; }
         }
     </style>
@@ -2060,7 +2085,7 @@ HTML_TEMPLATE = """
                 <a href="https://t.me/" target="_blank" class="btn-primary" style="background:#229ED9; font-size:0.8rem; padding:8px; text-align:center; text-decoration:none; display:block; margin-top:6px;">📢 Telegram Канал</a>
             </div>
 
-            <p id="version-text" style="font-size: 0.78rem; color: var(--text-sub); text-align: center; margin-top: 10px;">Cipher v1.0.2</p>
+            <p id="version-text" style="font-size: 0.78rem; color: var(--text-sub); text-align: center; margin-top: 10px;">Cipher v1.0.3</p>
         </div>
         
         <label style="font-size: 0.8rem; color: var(--text-sub); display: block; text-align:left; margin-bottom:4px;">Личный статус:</label>
