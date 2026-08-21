@@ -14,7 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
 
-app = FastAPI(title="Cipher Messenger v1.0.1")
+app = FastAPI(title="Cipher Messenger v1.0.2")
 
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -1129,7 +1129,7 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Cipher Messenger v1.0.1</title>
+    <title>Cipher Messenger v1.0.2</title>
     <style>
         :root[data-theme="dark"] {
             --bg-main: #0b0d13;
@@ -1525,16 +1525,34 @@ HTML_TEMPLATE = """
             padding: 20px;
         }
 
+        /* ИСПРАВЛЕННАЯ АДАПТИВНАЯ ШАПКА ЧАТА */
         .chat-header {
             height: 68px;
             background: var(--bg-header);
             display: flex;
             align-items: center;
             justify-content: space-between;
-            padding: 0 20px;
+            padding: 0 15px;
             border-bottom: 1px solid var(--border-color);
             flex-shrink: 0;
             z-index: 10;
+        }
+        .chat-header-left {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            min-width: 0;
+            flex: 1;
+        }
+        .chat-header-info {
+            cursor: pointer;
+            min-width: 0;
+            flex: 1;
+        }
+        .chat-header-info div {
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
         }
         .back-btn {
             display: none;
@@ -1542,8 +1560,8 @@ HTML_TEMPLATE = """
             border: none;
             color: var(--text-main);
             font-size: 1.4rem;
-            margin-right: 14px;
             cursor: pointer;
+            flex-shrink: 0;
         }
 
         .pinned-banner {
@@ -1874,39 +1892,13 @@ HTML_TEMPLATE = """
 
         @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.4; } 100% { opacity: 1; } }
 
-        /* ИСПРАВЛЕННЫЙ МОБИЛЬНЫЙ ИНТЕРФЕЙС */
         @media (max-width: 768px) {
-            #app-container {
-                position: relative;
-                width: 100vw;
-                height: 100vh;
-            }
-            #sidebar {
-                position: absolute;
-                inset: 0;
-                width: 100% !important;
-                z-index: 5;
-            }
-            #chat-area {
-                position: absolute;
-                inset: 0;
-                width: 100% !important;
-                height: 100% !important;
-                display: none;
-                z-index: 10;
-            }
-            body.in-chat #sidebar {
-                display: none;
-            }
-            body.in-chat #chat-area {
-                display: flex !important;
-            }
-            .back-btn {
-                display: block !important;
-            }
-            .bubble {
-                max-width: 82%;
-            }
+            #sidebar { width: 100%; }
+            #chat-area { display: none; }
+            body.in-chat #sidebar { display: none; }
+            body.in-chat #chat-area { display: flex; }
+            .back-btn { display: block; }
+            .bubble { max-width: 82%; }
         }
     </style>
 </head>
@@ -2068,7 +2060,7 @@ HTML_TEMPLATE = """
                 <a href="https://t.me/" target="_blank" class="btn-primary" style="background:#229ED9; font-size:0.8rem; padding:8px; text-align:center; text-decoration:none; display:block; margin-top:6px;">📢 Telegram Канал</a>
             </div>
 
-            <p id="version-text" style="font-size: 0.78rem; color: var(--text-sub); text-align: center; margin-top: 10px;">Cipher v1.0.1</p>
+            <p id="version-text" style="font-size: 0.78rem; color: var(--text-sub); text-align: center; margin-top: 10px;">Cipher v1.0.2</p>
         </div>
         
         <label style="font-size: 0.8rem; color: var(--text-sub); display: block; text-align:left; margin-bottom:4px;">Личный статус:</label>
@@ -2294,19 +2286,19 @@ HTML_TEMPLATE = """
 
         <div id="chat-content" style="display:none; flex-direction:column; height:100%;">
             <div class="chat-header">
-                <div style="display:flex; align-items:center;">
+                <div class="chat-header-left">
                     <button class="back-btn" onclick="document.body.classList.remove('in-chat')">←</button>
-                    <div class="avatar-small" id="header-avatar" style="width:42px; height:42px; font-size:1.1rem; margin-right:12px; cursor:pointer;" onclick="openPeerInfo()">?</div>
-                    <div style="cursor:pointer;" onclick="openPeerInfo()">
+                    <div class="avatar-small" id="header-avatar" style="width:40px; height:40px; font-size:1.1rem; cursor:pointer;" onclick="openPeerInfo()">?</div>
+                    <div class="chat-header-info" onclick="openPeerInfo()">
                         <div style="display:flex; align-items:center; gap:6px;">
-                            <span id="header-title" style="font-weight:600; font-size:1rem; color:var(--text-main);">Выберите чат</span>
+                            <span id="header-title" style="font-weight:600; font-size:0.95rem; color:var(--text-main);">Выберите чат</span>
                             <span id="header-dev-badge" class="dev-badge" style="display:none;">DEV</span>
                         </div>
-                        <div id="header-sub" style="font-size:0.78rem; color:var(--badge-blue);">Cipher Network</div>
+                        <div id="header-sub" style="font-size:0.75rem; color:var(--badge-blue);">Cipher Network</div>
                     </div>
                 </div>
 
-                <div style="display:flex; align-items:center; gap:8px;">
+                <div style="display:flex; align-items:center; gap:6px; flex-shrink:0;">
                     <button class="header-sub-btn" id="channel-action-btn" style="display:none;" onclick="toggleChannelSubscription()"></button>
                     <button class="icon-btn" id="channel-settings-btn" title="Настройки" style="display:none;" onclick="openChannelSettings()">⚙️</button>
                 </div>
