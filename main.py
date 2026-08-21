@@ -8,13 +8,13 @@ import re
 import base64
 from datetime import datetime
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
 
-app = FastAPI(title="Cipher Messenger v1.0")
+app = FastAPI(title="Cipher Messenger v1.0.1")
 
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -329,12 +329,10 @@ async def register(data: RegisterModel):
         admin_flag = 1 if is_admin(uname) else 0
         my_ref_code = uuid.uuid4().hex[:8]
 
-        # Обработка рефералки
         if ref:
             cur_ref = await db.execute("SELECT username FROM users WHERE referral_code = ?", (ref,))
             r_row = await cur_ref.fetchone()
             if r_row and r_row[0].lower() != uname:
-                # Начисляем пригласившему бонус
                 await db.execute("UPDATE users SET stars = stars + 10 WHERE LOWER(username) = LOWER(?)", (r_row[0],))
 
         await db.execute(
@@ -433,7 +431,6 @@ async def update_profile(data: UpdateProfileModel):
 
 @app.post("/api/buy_subscription")
 async def buy_subscription(data: StatusModel):
-    # Стоимость подписки: 100 звезд
     uname = data.username.strip().lower()
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("SELECT stars FROM users WHERE LOWER(username) = LOWER(?)", (uname,))
@@ -469,7 +466,6 @@ async def send_gift(data: GiftModel):
         if row[0] < data.cost:
             return {"status": "error", "message": "Недостаточно звезд для покупки подарка"}
 
-        # Снимаем звезды с отправителя
         if data.cost > 0:
             await db.execute("UPDATE users SET stars = stars - ? WHERE LOWER(username) = LOWER(?)", (data.cost, sender))
 
@@ -1133,7 +1129,7 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Cipher Messenger v1.0</title>
+    <title>Cipher Messenger v1.0.1</title>
     <style>
         :root[data-theme="dark"] {
             --bg-main: #0b0d13;
@@ -1340,8 +1336,10 @@ HTML_TEMPLATE = """
 
         #app-container {
             display: flex;
-            height: 100%;
-            width: 100%;
+            height: 100vh;
+            width: 100vw;
+            overflow: hidden;
+            position: relative;
         }
 
         #sidebar {
@@ -1352,6 +1350,7 @@ HTML_TEMPLATE = """
             flex-direction: column;
             height: 100%;
             flex-shrink: 0;
+            z-index: 5;
         }
 
         .sidebar-header {
@@ -1509,7 +1508,7 @@ HTML_TEMPLATE = """
             display: flex;
             flex-direction: column;
             background: var(--bg-chat);
-            height: 100vh;
+            height: 100%;
             position: relative;
             overflow: hidden;
         }
@@ -1715,12 +1714,12 @@ HTML_TEMPLATE = """
         .action-close { cursor: pointer; color: var(--text-sub); font-size: 1.1rem; }
 
         .input-bar {
-            padding: 12px 18px;
+            padding: 10px 14px;
             background: var(--bg-header);
             border-top: 1px solid var(--border-color);
             display: flex;
             align-items: center;
-            gap: 10px;
+            gap: 8px;
             position: relative;
             flex-shrink: 0;
             z-index: 10;
@@ -1730,7 +1729,7 @@ HTML_TEMPLATE = """
             background: var(--bg-input);
             border: 1px solid var(--border-color);
             border-radius: 14px;
-            padding: 0 14px;
+            padding: 0 12px;
             display: flex;
             align-items: center;
             gap: 8px;
@@ -1740,7 +1739,7 @@ HTML_TEMPLATE = """
             background: transparent;
             border: none;
             color: var(--text-main);
-            padding: 12px 0;
+            padding: 10px 0;
             font-size: 0.95rem;
             outline: none;
         }
@@ -1774,8 +1773,8 @@ HTML_TEMPLATE = """
             background: var(--badge-blue);
             border: none;
             color: white;
-            width: 42px;
-            height: 42px;
+            width: 40px;
+            height: 40px;
             border-radius: 12px;
             cursor: pointer;
             font-size: 1.1rem;
@@ -1787,8 +1786,8 @@ HTML_TEMPLATE = """
 
         .emoji-picker {
             position: absolute;
-            bottom: 65px;
-            left: 18px;
+            bottom: 60px;
+            left: 10px;
             background: var(--card-bg);
             border: 1px solid var(--card-border);
             border-radius: 14px;
@@ -1811,7 +1810,7 @@ HTML_TEMPLATE = """
         .scroll-down-btn {
             position: absolute;
             bottom: 80px;
-            right: 25px;
+            right: 20px;
             background: var(--badge-blue);
             color: white;
             border: none;
@@ -1875,13 +1874,39 @@ HTML_TEMPLATE = """
 
         @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.4; } 100% { opacity: 1; } }
 
+        /* ИСПРАВЛЕННЫЙ МОБИЛЬНЫЙ ИНТЕРФЕЙС */
         @media (max-width: 768px) {
-            #sidebar { width: 100%; }
-            #chat-area { display: none; }
-            body.in-chat #sidebar { display: none; }
-            body.in-chat #chat-area { display: flex; }
-            .back-btn { display: block; }
-            .bubble { max-width: 82%; }
+            #app-container {
+                position: relative;
+                width: 100vw;
+                height: 100vh;
+            }
+            #sidebar {
+                position: absolute;
+                inset: 0;
+                width: 100% !important;
+                z-index: 5;
+            }
+            #chat-area {
+                position: absolute;
+                inset: 0;
+                width: 100% !important;
+                height: 100% !important;
+                display: none;
+                z-index: 10;
+            }
+            body.in-chat #sidebar {
+                display: none;
+            }
+            body.in-chat #chat-area {
+                display: flex !important;
+            }
+            .back-btn {
+                display: block !important;
+            }
+            .bubble {
+                max-width: 82%;
+            }
         }
     </style>
 </head>
@@ -2017,7 +2042,6 @@ HTML_TEMPLATE = """
                 <span id="profile-pro-badge" class="pro-badge" style="display:none;">👑 PRO</span>
             </div>
 
-            <!-- Реферальная ссылка -->
             <div style="background:var(--bg-input); padding:10px; border-radius:10px; margin-bottom:12px;">
                 <label style="font-size: 0.75rem; color: var(--text-sub); display: block; margin-bottom:2px;">🎁 Реферальная ссылка:</label>
                 <div style="display:flex; gap:6px;">
@@ -2034,7 +2058,6 @@ HTML_TEMPLATE = """
 
             <button class="btn-primary" style="background:#ef4444; font-size:0.85rem; padding:8px; width:100%;" onclick="clearHistoryChat()">🧹 Очистить мою историю</button>
 
-            <!-- Кнопки релиза v1.0 -->
             <div style="display:flex; gap:6px; margin-top: 12px;">
                 <button class="btn-primary" style="background:#334155; font-size:0.8rem; padding:8px;" onclick="openAboutModal()">ℹ️ О проекте</button>
                 <button class="btn-primary" style="background:#334155; font-size:0.8rem; padding:8px;" onclick="openManifestModal()">📜 Манифест</button>
@@ -2045,7 +2068,7 @@ HTML_TEMPLATE = """
                 <a href="https://t.me/" target="_blank" class="btn-primary" style="background:#229ED9; font-size:0.8rem; padding:8px; text-align:center; text-decoration:none; display:block; margin-top:6px;">📢 Telegram Канал</a>
             </div>
 
-            <p id="version-text" style="font-size: 0.78rem; color: var(--text-sub); text-align: center; margin-top: 10px;">Cipher v1.0</p>
+            <p id="version-text" style="font-size: 0.78rem; color: var(--text-sub); text-align: center; margin-top: 10px;">Cipher v1.0.1</p>
         </div>
         
         <label style="font-size: 0.8rem; color: var(--text-sub); display: block; text-align:left; margin-bottom:4px;">Личный статус:</label>
@@ -2064,7 +2087,6 @@ HTML_TEMPLATE = """
     </div>
 </div>
 
-<!-- Модалка «О проекте» -->
 <div id="about-modal" class="modal-overlay" style="display: none;">
     <div class="card-modal">
         <h2>ℹ️ О проекте Cipher</h2>
@@ -2076,7 +2098,6 @@ HTML_TEMPLATE = """
     </div>
 </div>
 
-<!-- Модалка «Манифест» -->
 <div id="manifest-modal" class="modal-overlay" style="display: none;">
     <div class="card-modal">
         <h2>📜 Манифест Cipher</h2>
@@ -2091,7 +2112,6 @@ HTML_TEMPLATE = """
     </div>
 </div>
 
-<!-- Модалка «Roadmap» -->
 <div id="roadmap-modal" class="modal-overlay" style="display: none;">
     <div class="card-modal">
         <h2>🗺️ Roadmap развития</h2>
@@ -2108,7 +2128,6 @@ HTML_TEMPLATE = """
     </div>
 </div>
 
-<!-- Модалка «Сообщить об ошибке» -->
 <div id="bug-modal" class="modal-overlay" style="display: none;">
     <div class="card-modal">
         <h2>🐛 Сообщить об ошибке</h2>
@@ -2119,7 +2138,6 @@ HTML_TEMPLATE = """
     </div>
 </div>
 
-<!-- Модалка Покупки Звезд -->
 <div id="stars-modal" class="modal-overlay" style="display: none;">
     <div class="card-modal" style="text-align:center;">
         <h2>⭐ Покупка Telegram Stars</h2>
@@ -2134,7 +2152,6 @@ HTML_TEMPLATE = """
     </div>
 </div>
 
-<!-- Модалка Отправки Подарка -->
 <div id="gift-modal" class="modal-overlay" style="display: none;">
     <div class="card-modal" style="text-align:center;">
         <h2>🎁 Подарок пользователю</h2>
@@ -2189,7 +2206,6 @@ HTML_TEMPLATE = """
         <p id="info-status-text" style="font-size: 0.85rem; color: var(--online-green); margin-bottom: 4px;">🟢 В сети</p>
         <p id="info-date" style="color: var(--text-sub); font-size: 0.8rem; margin-bottom: 12px;">Регистрация: ...</p>
         
-        <!-- Полученные подарки -->
         <div id="user-gifts-container" style="display:flex; gap:6px; justify-content:center; margin-bottom: 14px; flex-wrap:wrap;"></div>
 
         <button class="btn-primary" style="background:#f59e0b; color:#000; margin-bottom:6px;" onclick="openGiftModal()">🎁 Отправить подарок</button>
@@ -2477,7 +2493,6 @@ HTML_TEMPLATE = """
 
     window.onload = () => {
         requestPermissionsOnStart();
-        // Автозаполнение рефералки из ссылки
         const urlParams = new URLSearchParams(window.location.search);
         const refParam = urlParams.get("ref");
         if (refParam) {
@@ -2823,7 +2838,7 @@ HTML_TEMPLATE = """
         if (data.status === "ok") {
             alert(data.message);
             user.is_pro = 1;
-            user.stars = (user.stars || 0) - 50; // с учетом бонуса или списания
+            user.stars = Math.max(0, (user.stars || 0) - 100);
             localStorage.setItem("messenger_user", JSON.stringify(user));
             location.reload();
         } else {
@@ -2963,7 +2978,6 @@ HTML_TEMPLATE = """
                 proBadge.style.display = data.is_pro ? "inline-flex" : "none";
             }
 
-            // Подгружаем подарки пользователя
             const giftsContainer = document.getElementById("user-gifts-container");
             giftsContainer.innerHTML = "Загрузка подарков...";
             try {
